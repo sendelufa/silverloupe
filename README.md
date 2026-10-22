@@ -1,45 +1,213 @@
 # Silverloupe
 
-Every frame deserves a closer look.
+> Every frame deserves a closer look.
 
-Основной dev-репозиторий: [sendelufa/silverloupe](https://github.com/sendelufa/silverloupe).
+Silverloupe — проект проверяемого ассистированного отбора фотографий для Codex и Claude Code. Цель — помочь фотографу разобрать съёмку, сохранить значимые кадры и защищённые комплекты, сформировать рабочий отбор и топ, а затем безопасно перенести подтверждённую разметку в Lightroom, Photoshop / Camera Raw или LightCraft.
 
-План коллекции скиллов для Codex и Claude Code: технический отсев, разметка, сравнение серий и выбор лучших фотографий с учётом жанра и художественного замысла. Целевые приложения: Lightroom, Photoshop / Camera Raw и LightCraft.
+## Текущий статус
 
-Статус на 22 октября 2026: исследование и проектирование. Рабочих скиллов, CLI и результатов фото-evals пока нет. Пороговые значения ниже — предлагаемые критерии приёмки, а не достигнутая точность.
+**Реализован фундамент проекта: контракты данных, deterministic eval-harness и диагностика окружения.** Полный workflow отбора фотографий пока не реализован.
 
-## Границы первой версии
+| Возможность | Статус |
+|---|---|
+| Версионированные Pydantic-контракты (`schema_version=1`) | Готово |
+| Валидация run-артефактов и deterministic graders | Готово |
+| Проверки fake IDs, полноты учёта, top-K и reject safety | Готово |
+| `silverloupe doctor` | Готово |
+| Разрешённый mini-fixture и manifest eval-данных | Готово |
+| Инвентаризация фотографий и генерация превью | Запланировано |
+| Группировка серий, RAW+JPEG, HDR, panorama и focus stack | Запланировано |
+| Техническая и художественная оценка | Запланировано |
+| Отчёт, ручные исправления и перенос в редакторы | Запланировано |
+| Production-набор из шести скиллов и установщик | Запланировано |
 
-- Подготовка фотографий, технические рекомендации, сравнение серий, рабочий отбор и топ с жанровыми профилями.
-- Статический HTML-отчёт и исправления решений через агента/CLI.
-- Проверенные пути переноса разметки в выбранный редактор с сохранением исходников и существующей обработки.
-- Установщик для Codex/Claude Code с выбором редактора; production-поставка из шести рабочих скиллов без evals и dev-зависимостей.
-- Первый внутренний прототип — одна сквозная свадебная сессия; пользовательский релиз — после проверки качества, интеграций и установки.
+Актуальные этапы и критерии готовности находятся в [плане разработки](docs/superpowers/plans/2026-10-22-silverloupe.md) и [GitHub Issues](https://github.com/sendelufa/silverloupe/issues).
 
-Автоматическое удаление фотографий, ретушь и обучение собственной модели не входят в первую версию. HTML-карточки со свайпами, принятием/отклонением и альтернативами запланированы следующей итерацией. Полностью локальная VLM и массовый API-режим — отдельные дальнейшие расширения.
+## Быстрый запуск
 
-Разработка отслеживается в [GitHub Issues](https://github.com/sendelufa/silverloupe/issues); подробные критерии приёмки находятся в плане ниже.
+### Требования
+
+- [uv](https://docs.astral.sh/uv/);
+- Git;
+- macOS, Linux или Windows с поддержкой Python 3.12.
+
+Версия Python зафиксирована в `.python-version`, зависимости — в `uv.lock`. Создавать virtualenv вручную не нужно.
+
+```bash
+git clone https://github.com/sendelufa/silverloupe.git
+cd silverloupe
+uv sync --locked
+```
+
+Проверьте окружение:
+
+```bash
+uv run --locked silverloupe doctor
+```
+
+Команда выводит компактный JSON и ничего не изменяет в библиотеке пользователя. Она сообщает состояние:
+
+- Python runtime;
+- версии Silverloupe core и схем;
+- ExifTool;
+- RAW backend (`rawpy`);
+- host-vision capability.
+
+Статусы `degraded` и `unavailable` — диагностический результат, а не скрытый успех. Например, отсутствие ExifTool или vision будет явно отражено в JSON.
+
+### Запуск тестов
+
+```bash
+uv run --locked pytest -q
+```
+
+Контрактный набор отдельно:
+
+```bash
+uv run --locked pytest tests/contracts tests/unit/test_eval_graders.py -q
+```
+
+## Что доступно сейчас
+
+### Контракты данных
+
+Модели находятся в [`src/silverloupe/contracts.py`](src/silverloupe/contracts.py) и используют строгую валидацию Pydantic. Определены:
+
+- `Brief`, `Asset`, `Manifest`, `Group` и `SelectionItem`;
+- `Assessment`, `Decision` и `Selection`;
+- `RunConfig`, `RunState` и `SessionConfig`;
+- `DeliveryPlan`, `DeliveryReceipt` и `InstallConfig`.
+
+Основные инварианты:
+
+- все схемы имеют `schema_version=1`;
+- `top_ids` всегда является подмножеством `selects_ids`;
+- `rating_proposal` допускает только `null` или целое значение `0..5`;
+- `unassessed` не может содержать доказанную визуальную оценку;
+- ссылки на неизвестные `asset_id` и `item_id` недопустимы;
+- K считается по `SelectionItem`, а не по количеству исходных файлов;
+- proposed reject нельзя экспортировать как reject-флаг без разрешённого authority.
+
+### Валидация run-артефактов
+
+Минимальный проверяемый run-каталог:
+
+```text
+run/
+├── assets.jsonl
+├── selection-items.json
+├── assessments.jsonl
+├── decisions.jsonl
+├── selection.json
+└── delivery-plan.json      # необязателен до этапа delivery
+```
+
+Python API:
+
+```python
+from pathlib import Path
+
+from evals.runner import grade_artifacts, validate_run
+
+errors = validate_run(Path("run"))
+
+grade = grade_artifacts(
+    {
+        "case_id": "reference-contracts",
+        "brief": {"top_k": 1},
+        "gold_good_item_ids": ["item-1"],
+    },
+    Path("run"),
+)
+```
+
+`validate_run()` всегда возвращает список ошибок вместо аварийного завершения на некорректных артефактах. `grade_artifacts()` возвращает общий результат, отдельные deterministic checks и объяснения ошибок.
+
+## Данные и безопасность
+
+- Реальные фотографии не входят в репозиторий.
+- Шесть плановых pilot-съёмок явно отмечены `real-data-unavailable` в [`evals/dataset-manifest.json`](evals/dataset-manifest.json).
+- Для файловых проверок используется созданный в репозитории CC0 PPM-fixture с зафиксированным SHA-256.
+- Автоматическое удаление фотографий не входит в проект.
+- MVP рассматривает reject как рекомендацию; proposed reject не становится флагом редактора без явного разрешения.
+- Silverloupe не изменяет `.lrcat` напрямую и не должен перезаписывать существующую XMP/ACR-обработку с нуля.
+
+## Для агентов-разработчиков
+
+### Начало работы
+
+1. Прочитайте этот README и актуальную задачу в GitHub Issues.
+2. Прочитайте раздел задачи в [implementation plan](docs/superpowers/plans/2026-10-22-silverloupe.md).
+3. Для контрактов и поведения сверяйтесь с [design spec](docs/superpowers/specs/2026-10-22-silverloupe-design.md) и [eval-программой](docs/evals.md).
+4. Запустите `uv sync --locked` и `uv run --locked pytest -q` до изменений.
+5. Реализуйте только выбранную задачу, соблюдая RED → GREEN для кода.
+6. Перед завершением повторите полный тестовый прогон и `silverloupe doctor`.
+
+### Источники истины
+
+При расхождениях используйте следующий приоритет:
+
+1. требования текущего GitHub Issue;
+2. design spec и глобальные ограничения;
+3. implementation plan;
+4. eval-программа;
+5. этот README как операционная сводка.
+
+README обязан отражать фактическое состояние репозитория, но не заменяет подробные спецификации.
+
+### Неподвижные ограничения
+
+- Production-поставка не содержит eval-harness, тестовые данные и dev-зависимости.
+- Runtime не импортирует `evals`; `TrialResult` остаётся dev-only контрактом.
+- Все команды разработки выполняются через `uv run --locked`.
+- Не добавляйте ложный fallback: отсутствие RAW, vision или editor capability должно давать `degraded`, `unavailable`, `partial` либо `failed`.
+- Не коммитьте реальные фотографии, приватные данные, generated reports и run-output.
+- Не объявляйте поддержку редактора, модели, ОС или формата без проверенной compatibility fixture.
+- Manual overrides имеют приоритет и должны сохраняться при повторном прогоне.
+
+## Карта репозитория
+
+| Путь | Назначение |
+|---|---|
+| `src/silverloupe/contracts.py` | Runtime-контракты и инварианты |
+| `src/silverloupe/cli.py` | CLI и `silverloupe doctor` |
+| `evals/runner.py` | Dev-only validation и deterministic graders |
+| `evals/contracts.py` | Dev-only `TrialResult` |
+| `evals/cases/` | Версионированные eval cases |
+| `evals/rubrics/` | Описания deterministic checks |
+| `tests/contracts/` | Контрактные тесты моделей и CLI |
+| `tests/unit/` | Unit-тесты graders |
+| `docs/superpowers/specs/` | Архитектура и дизайн |
+| `docs/superpowers/plans/` | Пошаговый implementation plan |
+| `docs/evals.md` | Данные, метрики, baselines и release gates |
+| `docs/distribution.md` | Production/install поставка |
+| `docs/requirements.md` | Runtime, модели, ресурсы и optional dependencies |
+
+## Как сохранять README актуальным
+
+Изменение не считается завершённым, если оно меняет пользовательское или агентское поведение, но не обновляет соответствующий раздел README.
+
+Перед каждым merge необходимо проверить:
+
+- команды установки и запуска копируются и выполняются без ручных поправок;
+- таблица статуса не выдаёт планируемую функцию за готовую;
+- новые CLI-команды, артефакты и обязательные зависимости документированы;
+- ограничения, degraded-режимы и опасные операции описаны явно;
+- карта репозитория и ссылки не содержат несуществующих путей;
+- README остаётся краткой точкой входа, а детали не дублируют спецификации целиком.
 
 ## Документация
 
-Читать в таком порядке:
+Рекомендуемый порядок чтения:
 
-1. [Архитектура, состав коллекции и progressive disclosure](docs/superpowers/specs/2026-10-22-silverloupe-design.md).
-2. [План разработки с проверяемыми результатами этапов](docs/superpowers/plans/2026-10-22-silverloupe.md).
-3. [Программа evals, тестовые наборы и метрики](docs/evals.md).
-4. [Dev/install-поставка и установщик с выбором редактора](docs/distribution.md).
-5. [HTML-review с принятием, отклонением и альтернативами — следующая итерация](docs/superpowers/specs/2026-10-22-silverloupe-review-ui-design.md).
-6. [Требования к моделям, железу и зависимостям](docs/requirements.md).
-7. [Best practices и первичные источники](docs/research.md).
+1. [Архитектура и состав коллекции](docs/superpowers/specs/2026-10-22-silverloupe-design.md)
+2. [План разработки](docs/superpowers/plans/2026-10-22-silverloupe.md)
+3. [Программа evals](docs/evals.md)
+4. [Поставка и установщик](docs/distribution.md)
+5. [HTML-review следующей итерации](docs/superpowers/specs/2026-10-22-silverloupe-review-ui-design.md)
+6. [Требования к моделям и ресурсам](docs/requirements.md)
+7. [Исследование и первичные источники](docs/research.md)
 
-Основное решение: компактные инструкции скиллов + общее детерминированное Python-ядро, запускаемое через `uv`. Скилл определяет задачу и критерии; код обрабатывает файлы, считает признаки, ведёт журнал и переносит разметку. Визуальная модель сравнивает кадры и предлагает решения, а сомнения остаются видимыми в очереди проверки.
+---
 
-Начать стоит с вертикального прототипа на одной свадебной съёмке: подготовка → серии → техническая проверка → кандидаты и топ → отчёт → проверяемый перенос разметки. Затем расширить профили архитектуры и пейзажа. До разрешения автоматического reject проверить сохранность хороших кадров на отложенных съёмках.
-
-Пользовательская поставка: шесть рабочих скиллов, runtime, установщик и выбранные интеграции. Седьмой скилл `silverloupe-eval`, тесты и данные оценки остаются в dev-репозитории. Install-репозиторий собирается автоматически из проверенного release. Выбор Lightroom, Photoshop/Camera Raw или LightCraft определяет backend записи метаданных.
-
-Первая пользовательская итерация: установщик, отбор, статический отчёт и проверенная разметка. Следующая итерация: HTML-карточки со свайпами/кнопками «принять» и «отклонить», просмотр альтернатив и сохранение прогресса. Отклонение предложенного кадра из топа не означает технический брак.
-
-Базовый профиль первой версии: host-vision, CPU-обработка без обязательной GPU, целевая конфигурация 16 ГБ RAM (32 ГБ для совместной работы с редактором), Python/uv и лёгкий runtime. Полностью локальная VLM — отдельное экспериментальное расширение. Ресурсные цифры пока являются целями тестирования, а не измеренными минимумами.
-
-Имена компонентов: продукт **Silverloupe**, будущие Python-пакет/модуль и CLI — `silverloupe`, главный скилл — `silverloupe`, остальные рабочие скиллы — `silverloupe-*`. Dev-only скилл — `silverloupe-eval`. Пользовательский install-репозиторий будет генерируемой поставкой; его адрес пока не задан.
+Основной репозиторий: [github.com/sendelufa/silverloupe](https://github.com/sendelufa/silverloupe)
