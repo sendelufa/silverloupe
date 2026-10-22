@@ -1,0 +1,16 @@
+# Local environment and credentials
+.DS_Store
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Generated distributions and session/evaluation output
+/build/
+/dist/
+/runs/
+/data/private/
