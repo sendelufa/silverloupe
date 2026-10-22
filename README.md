@@ -6,7 +6,7 @@ Silverloupe — проект проверяемого ассистированн
 
 ## Текущий статус
 
-**Реализован фундамент проекта: контракты данных, deterministic eval-harness и диагностика окружения.** Полный workflow отбора фотографий пока не реализован.
+**Реализованы контракты данных, deterministic eval-harness, диагностика окружения и read-only подготовка съёмки.** Группировка и сам отбор фотографий пока не реализованы.
 
 | Возможность | Статус |
 |---|---|
@@ -15,7 +15,9 @@ Silverloupe — проект проверяемого ассистированн
 | Проверки fake IDs, полноты учёта, top-K и reject safety | Готово |
 | `silverloupe doctor` | Готово |
 | Разрешённый mini-fixture и manifest eval-данных | Готово |
-| Инвентаризация фотографий и генерация превью | Запланировано |
+| Read-only инвентаризация и content SHA-256 | Готово |
+| Нормализованные превью и contact sheets | Готово |
+| SQLite checkpoint, `status` и `resume` | Готово |
 | Группировка серий, RAW+JPEG, HDR, panorama и focus stack | Запланировано |
 | Техническая и художественная оценка | Запланировано |
 | Отчёт, ручные исправления и перенос в редакторы | Запланировано |
@@ -55,6 +57,23 @@ uv run --locked silverloupe doctor
 
 Статусы `degraded` и `unavailable` — диагностический результат, а не скрытый успех. Например, отсутствие ExifTool или vision будет явно отражено в JSON.
 
+### Подготовить свою папку
+
+Команда рекурсивно читает поддерживаемые изображения, но не изменяет оригиналы:
+
+```bash
+uv run --locked silverloupe prepare /path/to/photos /path/to/silverloupe-output
+```
+
+Проверить состояние или продолжить прерванный запуск:
+
+```bash
+uv run --locked silverloupe status /path/to/silverloupe-output
+uv run --locked silverloupe resume /path/to/silverloupe-output
+```
+
+Если output находится внутри исходной папки, он автоматически исключается из повторного scan. Одинаковые имена и одинаковые байты в разных каталогах остаются отдельными assets; content hash хранится независимо. JPEG/PNG/TIFF/WebP и другие форматы Pillow получают нормализованное превью. RAW использует optional `rawpy`; без доступного декодера файл остаётся `unsupported/unassessed`, но не превращается в reject.
+
 ### Запуск тестов
 
 ```bash
@@ -88,9 +107,24 @@ uv run --locked pytest tests/contracts tests/unit/test_eval_graders.py -q
 - K считается по `SelectionItem`, а не по количеству исходных файлов;
 - proposed reject нельзя экспортировать как reject-флаг без разрешённого authority.
 
-### Валидация run-артефактов
+### Артефакты подготовки
 
-Минимальный проверяемый run-каталог:
+После `prepare` создаются только рабочие файлы внутри указанного output:
+
+```text
+silverloupe-output/
+├── session.json
+├── assets.jsonl
+├── state.sqlite3
+├── previews/
+└── contact-sheets/
+```
+
+`assets.jsonl` содержит относительный путь, отдельные `asset_id` и content SHA-256, EXIF/dimensions, `decode_status` и provenance превью. SQLite используется только для checkpoint/cache; JSONL остаётся обменным и аудиторским форматом.
+
+### Валидация полного run-контракта
+
+Eval-harness проверяет артефакты последующих этапов. `prepare` пока создаёт только `assets.jsonl`; остальные файлы появятся в задачах группировки и отбора:
 
 ```text
 run/
@@ -171,6 +205,9 @@ README обязан отражать фактическое состояние �
 |---|---|
 | `src/silverloupe/contracts.py` | Runtime-контракты и инварианты |
 | `src/silverloupe/cli.py` | CLI и `silverloupe doctor` |
+| `src/silverloupe/inventory.py` | Read-only scan, hashing и orchestration `prepare` |
+| `src/silverloupe/previews.py` | Orientation-aware previews и contact sheets |
+| `src/silverloupe/state.py` | SQLite checkpoint, session и status |
 | `evals/runner.py` | Dev-only validation и deterministic graders |
 | `evals/contracts.py` | Dev-only `TrialResult` |
 | `evals/cases/` | Версионированные eval cases |

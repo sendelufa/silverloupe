@@ -9,10 +9,13 @@ import os
 import platform
 import shutil
 import sys
+from pathlib import Path
 from typing import Any, Sequence
 
 from silverloupe import __version__
-from silverloupe.contracts import SCHEMA_VERSION
+from silverloupe.contracts import SCHEMA_VERSION, Brief, RunConfig
+from silverloupe.inventory import prepare, resume
+from silverloupe.state import read_status
 
 
 def doctor_report() -> dict[str, Any]:
@@ -54,12 +57,70 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="silverloupe")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("doctor", help="report runtime and optional capabilities")
+    prepare_parser = subparsers.add_parser("prepare", help="inventory images and create previews")
+    prepare_parser.add_argument("source")
+    prepare_parser.add_argument("output")
+    prepare_parser.add_argument("--max-edge", type=int, default=1600)
+    status_parser = subparsers.add_parser("status", help="show persisted preparation status")
+    status_parser.add_argument("output")
+    resume_parser = subparsers.add_parser("resume", help="resume preparation from checkpoints")
+    resume_parser.add_argument("output")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.command == "doctor":
-        print(json.dumps(doctor_report(), ensure_ascii=False, sort_keys=True))
-        return 0
+    try:
+        if args.command == "doctor":
+            print(json.dumps(doctor_report(), ensure_ascii=False, sort_keys=True))
+            return 0
+        if args.command == "prepare":
+            source = Path(args.source).expanduser().resolve()
+            output = Path(args.output).expanduser().resolve()
+            config = RunConfig(
+                source_roots=[str(source)],
+                output_root=str(output),
+                brief=Brief(),
+                rendering_policy={"max_edge": args.max_edge},
+            )
+            manifest = prepare(source, output, config)
+            unavailable = sum(asset.decode_status != "ready" for asset in manifest.assets)
+            print(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "assets": len(manifest.assets),
+                        "unavailable": unavailable,
+                        "output": str(output),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if args.command == "status":
+            print(json.dumps(read_status(Path(args.output)), ensure_ascii=False, sort_keys=True))
+            return 0
+        if args.command == "resume":
+            output = Path(args.output).expanduser().resolve()
+            manifest = resume(output)
+            print(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "assets": len(manifest.assets),
+                        "unavailable": sum(asset.decode_status != "ready" for asset in manifest.assets),
+                        "output": str(output),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0
+    except (FileNotFoundError, ValueError) as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    except OSError as error:
+        print(str(error), file=sys.stderr)
+        return 4
     return 2
