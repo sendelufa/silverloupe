@@ -59,6 +59,13 @@ def _load_required(path: Path, loader: Any, errors: list[str]) -> Any | None:
         return None
 
 
+def _json_array(value: Any, source: str, errors: list[str]) -> list[Any]:
+    if not isinstance(value, list):
+        errors.append(f"{source} must contain a JSON array")
+        return []
+    return value
+
+
 def _parsed_run(path: Path) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
     if not path.is_dir():
@@ -92,9 +99,24 @@ def _parsed_run(path: Path) -> tuple[dict[str, Any], list[str]]:
         except ValidationError as error:
             errors.append(f"selection.json: {error}")
 
-    items = _models(SelectionItem, items_value or [], "selection-items.json", errors)
-    assessments = _models(Assessment, assessments_value or [], "assessments.jsonl", errors)
-    decisions = _models(Decision, decisions_value or [], "decisions.jsonl", errors)
+    items = _models(
+        SelectionItem,
+        _json_array(items_value, "selection-items.json", errors),
+        "selection-items.json",
+        errors,
+    )
+    assessments = _models(
+        Assessment,
+        _json_array(assessments_value, "assessments.jsonl", errors),
+        "assessments.jsonl",
+        errors,
+    )
+    decisions = _models(
+        Decision,
+        _json_array(decisions_value, "decisions.jsonl", errors),
+        "decisions.jsonl",
+        errors,
+    )
 
     delivery_plan: DeliveryPlan | None = None
     delivery_path = path / "delivery-plan.json"
@@ -106,6 +128,7 @@ def _parsed_run(path: Path) -> tuple[dict[str, Any], list[str]]:
 
     asset_ids = {asset.asset_id for asset in manifest.assets} if manifest else set()
     item_ids = {item.item_id for item in items}
+    items_by_id = {item.item_id: item for item in items}
     if len(item_ids) != len(items):
         errors.append("selection-items.json: duplicate item_id values")
 
@@ -133,6 +156,14 @@ def _parsed_run(path: Path) -> tuple[dict[str, Any], list[str]]:
                 errors.append(f"delivery change references unknown asset_id '{change.asset_id}'")
             if change.item_id is not None and change.item_id not in item_ids:
                 errors.append(f"delivery change references unknown item_id '{change.item_id}'")
+            elif (
+                change.item_id is not None
+                and change.asset_id not in items_by_id[change.item_id].member_asset_ids
+            ):
+                errors.append(
+                    f"delivery change asset_id '{change.asset_id}' is not a member of item_id "
+                    f"'{change.item_id}'"
+                )
 
     return {
         "manifest": manifest,
@@ -168,7 +199,20 @@ def grade_artifacts(case: dict[str, Any], output: Path) -> dict[str, Any]:
 
     top_ids = selection.top_ids if selection else []
     expected_k = case.get("brief", {}).get("top_k")
-    requested_k_passed = expected_k is None or len(top_ids) == expected_k
+    allowed_shortfall = case.get("allowed_top_shortfall")
+    expected_shortfall_constraints = (
+        allowed_shortfall.get("unmet_constraints", [])
+        if isinstance(allowed_shortfall, dict)
+        else []
+    )
+    actual_unmet_constraints = selection.unmet_constraints if selection else []
+    honest_shortfall = (
+        isinstance(expected_k, int)
+        and len(top_ids) < expected_k
+        and bool(expected_shortfall_constraints)
+        and set(actual_unmet_constraints) == set(expected_shortfall_constraints)
+    )
+    requested_k_passed = expected_k is None or len(top_ids) == expected_k or honest_shortfall
 
     rejected = {decision.item_id for decision in decisions if decision.status.value == "reject"}
     all_item_ids = {item.item_id for item in items}
@@ -183,8 +227,8 @@ def grade_artifacts(case: dict[str, Any], output: Path) -> dict[str, Any]:
     proposed_reject_assets = {
         asset_id
         for item_id in proposed_rejects
-        for asset_id in items_by_id[item_id].member_asset_ids
         if item_id in items_by_id
+        for asset_id in items_by_id[item_id].member_asset_ids
     }
     exported_proposed_rejects: list[str] = []
     if delivery_plan:
@@ -193,7 +237,7 @@ def grade_artifacts(case: dict[str, Any], output: Path) -> dict[str, Any]:
             is_reject_value = change.value is True or str(change.value).lower() in {"reject", "rejected"}
             belongs_to_proposed_reject = (
                 change.item_id in proposed_rejects
-                or (change.item_id is None and change.asset_id in proposed_reject_assets)
+                or change.asset_id in proposed_reject_assets
             )
             if belongs_to_proposed_reject and is_reject_field and is_reject_value:
                 exported_proposed_rejects.append(change.item_id or change.asset_id)
@@ -201,12 +245,16 @@ def grade_artifacts(case: dict[str, Any], output: Path) -> dict[str, Any]:
     gold_good = set(case.get("gold_good_item_ids", []))
     rejected_gold = sorted(gold_good & rejected)
     manifest_asset_ids = {asset.asset_id for asset in manifest.assets} if manifest else set()
+    represented_asset_ids = {asset_id for item in items for asset_id in item.member_asset_ids}
     assessed_asset_ids = [assessment.asset_id for assessment in assessments]
     decided_item_ids = [decision.item_id for decision in decisions]
     missing_assessments = sorted(manifest_asset_ids - set(assessed_asset_ids))
+    unrepresented_assets = sorted(manifest_asset_ids - represented_asset_ids)
     missing_decisions = sorted(all_item_ids - set(decided_item_ids))
+    missing_gold = sorted(gold_good - (all_item_ids & set(decided_item_ids)))
     complete_accounting = (
         not missing_assessments
+        and not unrepresented_assets
         and not missing_decisions
         and len(assessed_asset_ids) == len(set(assessed_asset_ids))
         and len(decided_item_ids) == len(set(decided_item_ids))
@@ -219,11 +267,13 @@ def grade_artifacts(case: dict[str, Any], output: Path) -> dict[str, Any]:
             "top size is counted in SelectionItem IDs",
             actual=len(top_ids),
             expected=expected_k,
+            unmet_constraints=actual_unmet_constraints,
         ),
         "complete_accounting": _check(
             complete_accounting,
             "every asset has one assessment and every selection item has one decision",
             missing_asset_ids=missing_assessments,
+            unrepresented_asset_ids=unrepresented_assets,
             missing_item_ids=missing_decisions,
         ),
         "no_reject_all": _check(
@@ -238,9 +288,10 @@ def grade_artifacts(case: dict[str, Any], output: Path) -> dict[str, Any]:
             item_ids=sorted(set(exported_proposed_rejects)),
         ),
         "gold_good_retained": _check(
-            not rejected_gold,
-            "gold-good items must not be rejected",
-            item_ids=rejected_gold,
+            not rejected_gold and not missing_gold,
+            "gold-good items must be present, decided, and not rejected",
+            rejected_item_ids=rejected_gold,
+            missing_item_ids=missing_gold,
         ),
     }
     failed_messages = [check["message"] for check in checks.values() if not check["passed"]]

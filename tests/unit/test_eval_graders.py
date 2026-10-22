@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from evals.runner import grade_artifacts, validate_run
 
 
@@ -195,6 +197,111 @@ def test_fake_item_ids_fail_validation_grader(tmp_path: Path) -> None:
     assert grade["checks"]["valid_references"]["passed"] is False
 
 
+def test_unknown_rejected_item_returns_failed_grade_instead_of_crashing(tmp_path: Path) -> None:
+    _write_reference_run(tmp_path / "run")
+    _write_jsonl(
+        tmp_path / "run/decisions.jsonl",
+        [
+            {
+                "schema_version": 1,
+                "item_id": "item-missing",
+                "status": "reject",
+                "tier": "none",
+                "decision_authority": "proposal",
+            }
+        ],
+    )
+
+    grade = grade_artifacts({"case_id": "unknown-rejected-item"}, tmp_path / "run")
+
+    assert grade["passed"] is False
+    assert grade["checks"]["valid_references"]["passed"] is False
+
+
+@pytest.mark.parametrize("malformed", [None, {}, "", 42, True])
+def test_malformed_selection_item_collection_returns_validation_error(
+    tmp_path: Path, malformed: object
+) -> None:
+    _write_reference_run(tmp_path / "run")
+    _write_json(tmp_path / "run/selection-items.json", malformed)
+
+    errors = validate_run(tmp_path / "run")
+
+    assert any("selection-items.json must contain a JSON array" in error for error in errors)
+
+
+def test_reject_flag_with_mismatched_existing_item_id_still_fails_safety_grader(tmp_path: Path) -> None:
+    _write_reference_run(tmp_path / "run")
+    _write_json(
+        tmp_path / "run/selection-items.json",
+        [
+            {
+                "schema_version": 1,
+                "item_id": "item-reject",
+                "kind": "capture",
+                "member_asset_ids": ["asset-1"],
+                "primary_asset_id": "asset-1",
+                "required_asset_ids": ["asset-1"],
+                "group_ids": [],
+            },
+            {
+                "schema_version": 1,
+                "item_id": "item-keep",
+                "kind": "capture",
+                "member_asset_ids": ["asset-2"],
+                "primary_asset_id": "asset-2",
+                "required_asset_ids": ["asset-2"],
+                "group_ids": [],
+            },
+        ],
+    )
+    _write_jsonl(
+        tmp_path / "run/decisions.jsonl",
+        [
+            {
+                "schema_version": 1,
+                "item_id": "item-reject",
+                "status": "reject",
+                "tier": "none",
+                "decision_authority": "proposal",
+            },
+            {
+                "schema_version": 1,
+                "item_id": "item-keep",
+                "status": "keep",
+                "tier": "top",
+                "decision_authority": "proposal",
+            },
+        ],
+    )
+    _write_json(
+        tmp_path / "run/selection.json",
+        {
+            "schema_version": 1,
+            "selects_ids": ["item-keep"],
+            "top_ids": ["item-keep"],
+            "ranked_ids": ["item-keep", "item-reject"],
+        },
+    )
+    _write_json(
+        tmp_path / "run/delivery-plan.json",
+        {
+            "schema_version": 1,
+            "target": "lightroom",
+            "profile_version": "1",
+            "asset_mappings": [{"asset_id": "asset-1", "target_id": "fixture.ppm"}],
+            "proposed_changes": [
+                {"asset_id": "asset-1", "item_id": "item-keep", "field": "reject_flag", "value": True}
+            ],
+        },
+    )
+
+    grade = grade_artifacts({"case_id": "mismatched-reject-mapping"}, tmp_path / "run")
+
+    assert grade["checks"]["valid_references"]["passed"] is False
+    assert grade["checks"]["proposed_reject_not_exported"]["passed"] is False
+
+
 def test_reject_all_fails_safety_grader(tmp_path: Path) -> None:
     _write_reference_run(tmp_path / "run")
     _write_jsonl(
@@ -234,6 +341,68 @@ def test_missing_asset_assessment_fails_complete_accounting(tmp_path: Path) -> N
     grade = grade_artifacts({"case_id": "incomplete-accounting"}, tmp_path / "run")
 
     assert grade["checks"]["complete_accounting"]["passed"] is False
+
+
+def test_asset_omitted_from_every_selection_item_fails_complete_accounting(tmp_path: Path) -> None:
+    _write_reference_run(tmp_path / "run")
+    items_path = tmp_path / "run/selection-items.json"
+    items = json.loads(items_path.read_text())
+    items[0]["member_asset_ids"] = ["asset-1"]
+    _write_json(items_path, items)
+
+    grade = grade_artifacts({"case_id": "asset-omitted"}, tmp_path / "run")
+
+    assert grade["checks"]["complete_accounting"]["passed"] is False
+
+
+def test_missing_gold_good_item_fails_retention_grader(tmp_path: Path) -> None:
+    _write_reference_run(tmp_path / "run")
+
+    grade = grade_artifacts(
+        {"case_id": "missing-gold", "gold_good_item_ids": ["item-missing"]},
+        tmp_path / "run",
+    )
+
+    assert grade["checks"]["gold_good_retained"]["passed"] is False
+
+
+def test_explicit_honest_top_shortfall_passes_requested_k_grader(tmp_path: Path) -> None:
+    _write_reference_run(tmp_path / "run")
+    selection_path = tmp_path / "run/selection.json"
+    selection = json.loads(selection_path.read_text())
+    selection["unmet_constraints"] = ["insufficient_qualified_items"]
+    _write_json(selection_path, selection)
+
+    grade = grade_artifacts(
+        {
+            "case_id": "honest-shortfall",
+            "brief": {"top_k": 3},
+            "allowed_top_shortfall": {"unmet_constraints": ["insufficient_qualified_items"]},
+        },
+        tmp_path / "run",
+    )
+
+    assert grade["checks"]["requested_k"]["passed"] is True
+    assert grade["checks"]["requested_k"]["actual"] == 1
+
+
+def test_top_shortfall_with_unexpected_reason_still_fails_requested_k_grader(tmp_path: Path) -> None:
+    _write_reference_run(tmp_path / "run")
+    selection_path = tmp_path / "run/selection.json"
+    selection = json.loads(selection_path.read_text())
+    selection["unmet_constraints"] = ["different_reason"]
+    _write_json(selection_path, selection)
+
+    grade = grade_artifacts(
+        {
+            "case_id": "dishonest-shortfall",
+            "brief": {"top_k": 3},
+            "allowed_top_shortfall": {"unmet_constraints": ["insufficient_qualified_items"]},
+        },
+        tmp_path / "run",
+    )
+
+    assert grade["checks"]["requested_k"]["passed"] is False
 
 
 def test_valid_reference_output_passes_all_deterministic_graders(tmp_path: Path) -> None:
