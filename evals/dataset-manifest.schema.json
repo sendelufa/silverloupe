@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://silverloupe.dev/schemas/dataset-manifest.schema.json",
+  "title": "Silverloupe evaluation dataset manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "datasets", "fixtures"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "datasets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["dataset_id", "role", "genre", "availability", "reason"],
+        "properties": {
+          "dataset_id": {"type": "string", "minLength": 1},
+          "role": {"enum": ["pilot", "development", "sealed-test"]},
+          "genre": {"enum": ["wedding", "architecture", "landscape", "mixed"]},
+          "availability": {"enum": ["available", "real-data-unavailable"]},
+          "reason": {"type": "string", "minLength": 1},
+          "path": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "fixtures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["fixture_id", "path", "purpose", "license", "provenance"],
+        "properties": {
+          "fixture_id": {"type": "string", "minLength": 1},
+          "path": {"type": "string", "minLength": 1},
+          "purpose": {"type": "string", "minLength": 1},
+          "license": {"type": "string", "minLength": 1},
+          "provenance": {"type": "string", "minLength": 1},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    }
+  }
+}

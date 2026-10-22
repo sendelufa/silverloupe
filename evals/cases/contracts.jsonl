@@ -1,0 +1,3 @@
+{"case_id":"reference-contracts","brief":{"top_k":1},"gold_good_item_ids":["item-1"],"grader_keys":["valid_references","requested_k","complete_accounting","no_reject_all","proposed_reject_not_exported","gold_good_retained"]}
+{"case_id":"adversarial-fake-ids","brief":{"top_k":1},"mutation":"inject_unknown_item_id","grader_keys":["valid_references"]}
+{"case_id":"adversarial-reject-all","brief":{"top_k":1},"mutation":"set_all_decisions_to_reject","grader_keys":["no_reject_all","gold_good_retained"]}

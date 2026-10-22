@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "checks": {
+    "valid_references": "Every asset_id and item_id resolves within the same run and every artifact matches schema version 1.",
+    "requested_k": "top_k counts SelectionItem identifiers, not member source assets.",
+    "complete_accounting": "Every asset has exactly one assessment and every selection item has exactly one decision.",
+    "no_reject_all": "Rejecting every item fails unless the case explicitly permits it.",
+    "proposed_reject_not_exported": "A proposal-authority reject cannot become an editor reject flag.",
+    "gold_good_retained": "Known-good items are never rejected."
+  }
+}

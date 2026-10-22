@@ -6,8 +6,12 @@
 .venv/
 __pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
 .ruff_cache/
+.superpowers/
+.coverage
+htmlcov/
 
 # Generated distributions and session/evaluation output
 /build/

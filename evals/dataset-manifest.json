@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "datasets": [
+    {"dataset_id": "pilot-wedding-01", "role": "pilot", "genre": "wedding", "availability": "real-data-unavailable", "reason": "No consented, redistributable real shoot has been supplied."},
+    {"dataset_id": "pilot-wedding-02", "role": "pilot", "genre": "wedding", "availability": "real-data-unavailable", "reason": "No consented, redistributable real shoot has been supplied."},
+    {"dataset_id": "pilot-architecture-01", "role": "pilot", "genre": "architecture", "availability": "real-data-unavailable", "reason": "No consented, redistributable real shoot has been supplied."},
+    {"dataset_id": "pilot-architecture-02", "role": "pilot", "genre": "architecture", "availability": "real-data-unavailable", "reason": "No consented, redistributable real shoot has been supplied."},
+    {"dataset_id": "pilot-landscape-01", "role": "pilot", "genre": "landscape", "availability": "real-data-unavailable", "reason": "No consented, redistributable real shoot has been supplied."},
+    {"dataset_id": "pilot-landscape-02", "role": "pilot", "genre": "landscape", "availability": "real-data-unavailable", "reason": "No consented, redistributable real shoot has been supplied."}
+  ],
+  "fixtures": [
+    {
+      "fixture_id": "generated-checkerboard-ppm",
+      "path": "fixtures/files/checkerboard.ppm",
+      "purpose": "Small licensed image for file hashing and mutation checks.",
+      "license": "CC0-1.0",
+      "provenance": "Generated in-repository as a 2x2 black-and-white PPM fixture.",
+      "sha256": "ec3de99cabcaa9699898beb9a49ddc74e8c62de3a323f6e189a516dce6bf0a2c"
+    }
+  ]
+}
