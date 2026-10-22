@@ -8,6 +8,7 @@ import json
 import os
 import platform
 import shutil
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -120,7 +121,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (FileNotFoundError, ValueError) as error:
         print(str(error), file=sys.stderr)
         return 2
-    except OSError as error:
+    except (OSError, sqlite3.Error) as error:
         print(str(error), file=sys.stderr)
         return 4
     return 2

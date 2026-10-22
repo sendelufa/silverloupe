@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from PIL import Image, UnidentifiedImageError
+
 from silverloupe.contracts import Asset, RunConfig, SessionConfig
 
 
@@ -32,12 +34,18 @@ class CheckpointStore:
             CREATE TABLE IF NOT EXISTS asset_checkpoints (
                 asset_id TEXT PRIMARY KEY,
                 content_sha256 TEXT NOT NULL,
+                cache_key TEXT,
                 asset_json TEXT NOT NULL,
                 preview_path TEXT,
                 updated_at TEXT NOT NULL
             )
             """
         )
+        columns = {
+            row[1] for row in self.connection.execute("PRAGMA table_info(asset_checkpoints)")
+        }
+        if "cache_key" not in columns:
+            self.connection.execute("ALTER TABLE asset_checkpoints ADD COLUMN cache_key TEXT")
         self.connection.execute(
             """
             CREATE TABLE IF NOT EXISTS run_status (
@@ -71,26 +79,42 @@ class CheckpointStore:
         )
         self.connection.commit()
 
-    def cached(self, asset: Asset) -> Asset | None:
+    def cached(self, asset: Asset, cache_key: str) -> Asset | None:
         row = self.connection.execute(
-            "SELECT content_sha256, asset_json, preview_path FROM asset_checkpoints WHERE asset_id = ?",
+            """
+            SELECT content_sha256, cache_key, asset_json, preview_path
+            FROM asset_checkpoints WHERE asset_id = ?
+            """,
             (asset.asset_id,),
         ).fetchone()
-        if row is None or row[0] != asset.content_sha256:
+        if row is None or row[0] != asset.content_sha256 or row[1] != cache_key:
             return None
-        preview_path = row[2]
-        if preview_path and not (self.output / preview_path).is_file():
-            return None
-        return Asset.model_validate_json(row[1])
+        preview_path = row[3]
+        if preview_path:
+            relative = Path(preview_path)
+            if relative.is_absolute() or ".." in relative.parts:
+                return None
+            candidate = self.output / relative
+            if candidate.is_symlink() or not candidate.resolve().is_relative_to(self.output.resolve()):
+                return None
+            try:
+                with Image.open(candidate) as image:
+                    image.verify()
+            except (Image.DecompressionBombError, OSError, UnidentifiedImageError):
+                return None
+        return Asset.model_validate_json(row[2])
 
-    def record(self, asset: Asset) -> None:
+    def record(self, asset: Asset, cache_key: str) -> None:
         provenance = asset.preview_provenance or {}
         self.connection.execute(
             """
-            INSERT INTO asset_checkpoints(asset_id, content_sha256, asset_json, preview_path, updated_at)
-            VALUES(?, ?, ?, ?, ?)
+            INSERT INTO asset_checkpoints(
+                asset_id, content_sha256, cache_key, asset_json, preview_path, updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?)
             ON CONFLICT(asset_id) DO UPDATE SET
                 content_sha256=excluded.content_sha256,
+                cache_key=excluded.cache_key,
                 asset_json=excluded.asset_json,
                 preview_path=excluded.preview_path,
                 updated_at=excluded.updated_at
@@ -98,6 +122,7 @@ class CheckpointStore:
             (
                 asset.asset_id,
                 asset.content_sha256,
+                cache_key,
                 asset.model_dump_json(),
                 provenance.get("path"),
                 _now(),

@@ -65,6 +65,12 @@ uv run --locked silverloupe doctor
 uv run --locked silverloupe prepare /path/to/photos /path/to/silverloupe-output
 ```
 
+Размер длинной стороны превью можно ограничить явно:
+
+```bash
+uv run --locked silverloupe prepare /path/to/photos /path/to/silverloupe-output --max-edge 1600
+```
+
 Проверить состояние или продолжить прерванный запуск:
 
 ```bash
@@ -72,7 +78,9 @@ uv run --locked silverloupe status /path/to/silverloupe-output
 uv run --locked silverloupe resume /path/to/silverloupe-output
 ```
 
-Если output находится внутри исходной папки, он автоматически исключается из повторного scan. Одинаковые имена и одинаковые байты в разных каталогах остаются отдельными assets; content hash хранится независимо. JPEG/PNG/TIFF/WebP и другие форматы Pillow получают нормализованное превью. RAW использует optional `rawpy`; без доступного декодера файл остаётся `unsupported/unassessed`, но не превращается в reject.
+Если output находится внутри исходной папки, он автоматически исключается из повторного scan. Output не может совпадать с source или быть его родительским каталогом. Silverloupe отклоняет симлинки на своих служебных путях до записи, чтобы генерация и очистка не могли затронуть оригиналы.
+
+Одинаковые имена и одинаковые байты в разных каталогах остаются отдельными assets; content hash хранится независимо. JPEG/PNG/TIFF/WebP и другие форматы Pillow получают нормализованное превью. RAW использует optional `rawpy`; без доступного декодера файл остаётся `unsupported/unassessed`, но не превращается в reject. Ключ кэша учитывает content hash, rendering policy, версию renderer и доступность RAW backend, а повреждённые превью автоматически пересоздаются при `resume`.
 
 ### Запуск тестов
 
@@ -116,11 +124,11 @@ silverloupe-output/
 ├── session.json
 ├── assets.jsonl
 ├── state.sqlite3
-├── previews/
+├── previews/              # JPEG + provenance sidecars
 └── contact-sheets/
 ```
 
-`assets.jsonl` содержит относительный путь, отдельные `asset_id` и content SHA-256, EXIF/dimensions, `decode_status` и provenance превью. SQLite используется только для checkpoint/cache; JSONL остаётся обменным и аудиторским форматом.
+`assets.jsonl` содержит относительный путь, отдельные `asset_id` и content SHA-256, вложенные фотографические EXIF-поля, dimensions, `decode_status` и provenance превью. Для RAW provenance различает embedded JPEG/bitmap и postprocess fallback. SQLite используется только для пофайлового checkpoint/cache; JSONL записывается как целостный обменный и аудиторский snapshot, а не переписывается после каждого кадра.
 
 ### Валидация полного run-контракта
 
@@ -160,6 +168,8 @@ grade = grade_artifacts(
 ## Данные и безопасность
 
 - Реальные фотографии не входят в репозиторий.
+- `prepare` читает оригиналы и проверяет неизменность content hash до и после render; изменившийся во время запуска файл получает честный `degraded`, а не ложное готовое превью.
+- Служебные пути output проверяются на выход за корень и небезопасные симлинки до любых изменений.
 - Шесть плановых pilot-съёмок явно отмечены `real-data-unavailable` в [`evals/dataset-manifest.json`](evals/dataset-manifest.json).
 - Для файловых проверок используется созданный в репозитории CC0 PPM-fixture с зафиксированным SHA-256.
 - Автоматическое удаление фотографий не входит в проект.
@@ -213,7 +223,8 @@ README обязан отражать фактическое состояние �
 | `evals/cases/` | Версионированные eval cases |
 | `evals/rubrics/` | Описания deterministic checks |
 | `tests/contracts/` | Контрактные тесты моделей и CLI |
-| `tests/unit/` | Unit-тесты graders |
+| `tests/unit/` | Unit-тесты graders и inventory |
+| `tests/integration/` | Resume, cache, RAW/EXIF и безопасность подготовки |
 | `docs/superpowers/specs/` | Архитектура и дизайн |
 | `docs/superpowers/plans/` | Пошаговый implementation plan |
 | `docs/evals.md` | Данные, метрики, baselines и release gates |
