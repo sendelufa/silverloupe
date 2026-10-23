@@ -6,7 +6,7 @@ Silverloupe — проект проверяемого ассистированн
 
 ## Текущий статус
 
-**Реализованы контракты данных, deterministic eval-harness, диагностика окружения, read-only подготовка съёмки и консервативная группировка серий/композитов.** Техническая оценка и сам художественный отбор фотографий пока не реализованы.
+**Реализованы контракты данных, deterministic eval-harness, диагностика окружения, read-only подготовка съёмки, консервативная группировка и recommendation-only техническая оценка с проверяемым host-vision exchange.** Жанровая редактура, итоговые `selects`/`top` и перенос разметки в редакторы пока не реализованы.
 
 | Возможность | Статус |
 |---|---|
@@ -20,7 +20,9 @@ Silverloupe — проект проверяемого ассистированн
 | SQLite checkpoint, `status` и `resume` | Готово |
 | Группировка серий, RAW+JPEG, HDR, panorama и focus stack | Готово |
 | Защищённые composite-наборы и единицы отбора | Готово |
-| Техническая и художественная оценка | Запланировано |
+| Локальные технические сигналы и безопасный triage | Готово |
+| Проверяемый `vision-request` / `vision-import` | Готово |
+| Жанровая редактура и итоговые `selects` / `top` | Запланировано |
 | Отчёт, ручные исправления и перенос в редакторы | Запланировано |
 | Production-набор из шести скиллов и установщик | Запланировано |
 
@@ -99,6 +101,54 @@ uv run --locked silverloupe group /path/to/silverloupe-output --reset-manual-gro
 
 Пересекающиеся защищённые composite-группы команда отклонит: сначала конфликт нужно разрешить в `groups.json` или перевести связь в `uncertain`.
 
+### Получить техническую оценку
+
+После `group` измерьте локальные сигналы:
+
+```bash
+uv run --locked silverloupe assess /path/to/silverloupe-output
+```
+
+Пока визуальные свидетельства не импортированы, команда завершится кодом `3` и статусом `partial`. Это ожидаемое безопасное состояние: численные признаки записаны, но не объявлены доказательством резкости, намерения или состояния глаз. Автоматический reject в MVP всегда выключен.
+
+Для визуальной проверки сформируйте обменный файл:
+
+```bash
+uv run --locked silverloupe vision-request /path/to/silverloupe-output
+```
+
+`vision-request.json` содержит только безопасные относительные пути превью, стабильные `artifact_id`, критерии и номер попытки. Передайте этот файл host-агенту Codex/Claude вместе с перечисленными изображениями. Ответ должен ссылаться только на фактически просмотренные `artifact_id`; минимальная форма:
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "vision-…",
+  "status": "completed",
+  "observations": [
+    {
+      "schema_version": 1,
+      "asset_id": "…",
+      "observed_artifact_ids": ["overview-…"],
+      "visual_criteria": {"focus": "acceptable"},
+      "region_evidence": [],
+      "intent_hypotheses": [],
+      "uncertainty": []
+    }
+  ],
+  "error": null
+}
+```
+
+Импортируйте ответ:
+
+```bash
+uv run --locked silverloupe vision-import \
+  /path/to/silverloupe-output \
+  /path/to/vision-response.json
+```
+
+Несуществующий observed ID, чужой asset, невалидный JSON или region evidence без просмотренного artifact отклоняются без замены прежних оценок. Для `transient_error` допускаются не более двух повторов; после исчерпания попыток результат остаётся `partial/review`.
+
 Если output находится внутри исходной папки, он автоматически исключается из повторного scan. Output не может совпадать с source или быть его родительским каталогом. Silverloupe отклоняет симлинки на своих служебных путях до записи, чтобы генерация и очистка не могли затронуть оригиналы.
 
 Одинаковые имена и одинаковые байты в разных каталогах остаются отдельными assets; content hash хранится независимо. JPEG/PNG/TIFF/WebP и другие форматы Pillow получают нормализованное превью. RAW использует optional `rawpy`; без доступного декодера файл остаётся `unsupported/unassessed`, но не превращается в reject. Ключ кэша учитывает content hash, rendering policy, версию renderer и доступность RAW backend, а повреждённые превью автоматически пересоздаются при `resume`.
@@ -148,6 +198,11 @@ silverloupe-output/
 ├── groups.json
 ├── selection-items.json
 ├── grouping-report.json
+├── assessments.jsonl
+├── decisions.jsonl
+├── assessment-report.json
+├── vision-request.json     # появляется после vision-request
+├── vision-status.json      # pending / retry_required / completed / partial
 ├── previews/              # JPEG + provenance sidecars
 └── contact-sheets/
 ```
@@ -157,6 +212,8 @@ silverloupe-output/
 `groups.json` хранит неплоские отношения: byte duplicates, RAW/JPEG companions, bursts, near duplicates и защищённые HDR/panorama/focus-stack комплекты. Один asset может участвовать в нескольких отношениях. `selection-items.json` схлопывает только подтверждённые связи: RAW+JPEG становится одним capture-item, а защищённый комплект — одним composite-item со всеми `required_asset_ids`. Слабые или конфликтующие признаки остаются `uncertain` и не объединяют пункты отбора.
 
 `grouping-report.json` показывает число кандидатов, типы групп и `review_group_ids`. Значение `real_photo_validation=unavailable` честно сохраняется, пока нет разрешённого пилотного набора; синтетические fixtures не объявляются доказательством совместимости конкретной камеры.
+
+`assessments.jsonl` хранит численные сигналы по каждому asset отдельно от visual evidence. Локальная дисперсия Лапласиана, яркость и высокочастотная энергия являются только baseline-сигналами: low/high key, grain, soft focus и motion blur остаются контекстными. `decisions.jsonl` содержит только proposal-решения `keep`, `review` или `unassessed`; `automatic_rejects` в отчёте равен нулю. Общие исключения описаны в [`resources/artistic-intent.md`](resources/artistic-intent.md).
 
 ### Валидация полного run-контракта
 
@@ -201,6 +258,8 @@ grade = grade_artifacts(
 - Служебные пути output проверяются на выход за корень и небезопасные симлинки до любых изменений.
 - Группировка использует индекс по камере/времени с ограниченным числом соседей, а не полный попарный перебор; совпадение имени без согласованных EXIF-свидетельств не создаёт RAW/JPEG-пару.
 - HDR, panorama и focus stack являются защищёнными наборами: неоднозначное пересечение переводится в `uncertain`, а не приводит к потере обязательных исходников.
+- Маленькое превью, неподдерживаемый RAW, возможный смаз, шум и крайняя экспозиция дают uncertainty/review, а не безусловный reject.
+- Визуальные утверждения принимаются только вместе с известными `observed_artifact_ids`; невалидный или неполный ответ не становится успешным результатом.
 - Шесть плановых pilot-съёмок явно отмечены `real-data-unavailable` в [`evals/dataset-manifest.json`](evals/dataset-manifest.json).
 - Для файловых проверок используется созданный в репозитории CC0 PPM-fixture с зафиксированным SHA-256.
 - Автоматическое удаление фотографий не входит в проект.
@@ -251,12 +310,16 @@ README обязан отражать фактическое состояние �
 | `src/silverloupe/state.py` | SQLite checkpoint, session и status |
 | `src/silverloupe/grouping.py` | Индекс кандидатов, группы и `SelectionItem` |
 | `src/silverloupe/comparisons.py` | Бок-о-бок comparison batches |
+| `src/silverloupe/signals.py` | Консервативные численные сигналы по превью |
+| `src/silverloupe/triage.py` | Assessment, review-only decisions и артефакты CLI |
+| `src/silverloupe/vision/` | Контракты и валидация host-vision exchange |
+| `resources/artistic-intent.md` | Общие художественные исключения для triage |
 | `evals/runner.py` | Dev-only validation и deterministic graders |
 | `evals/contracts.py` | Dev-only `TrialResult` |
 | `evals/cases/` | Версионированные eval cases |
 | `evals/rubrics/` | Описания deterministic checks |
 | `tests/contracts/` | Контрактные тесты моделей и CLI |
-| `tests/unit/` | Unit-тесты graders, inventory и grouping |
+| `tests/unit/` | Unit-тесты graders, inventory, grouping и triage |
 | `tests/integration/` | Resume, cache, RAW/EXIF и безопасность подготовки |
 | `docs/superpowers/specs/` | Архитектура и дизайн |
 | `docs/superpowers/plans/` | Пошаговый implementation plan |

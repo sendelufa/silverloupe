@@ -30,6 +30,11 @@ _OWNED_FILES = (
     "groups.json",
     "selection-items.json",
     "grouping-report.json",
+    "assessments.jsonl",
+    "decisions.jsonl",
+    "assessment-report.json",
+    "vision-request.json",
+    "vision-status.json",
 )
 
 

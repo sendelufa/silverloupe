@@ -18,6 +18,11 @@ from silverloupe.contracts import SCHEMA_VERSION, Brief, RunConfig
 from silverloupe.grouping import group_prepared
 from silverloupe.inventory import prepare, resume
 from silverloupe.state import read_status
+from silverloupe.triage import (
+    assess_prepared,
+    create_vision_request_prepared,
+    import_vision_response_prepared,
+)
 
 
 def doctor_report() -> dict[str, Any]:
@@ -80,6 +85,19 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="discard saved manual groups and replace them with automatic grouping",
     )
+    assess_parser = subparsers.add_parser(
+        "assess", help="measure technical signals and propose review-only triage"
+    )
+    assess_parser.add_argument("output")
+    vision_request_parser = subparsers.add_parser(
+        "vision-request", help="write an auditable host-vision request"
+    )
+    vision_request_parser.add_argument("output")
+    vision_import_parser = subparsers.add_parser(
+        "vision-import", help="validate and import a host-vision response"
+    )
+    vision_import_parser.add_argument("output")
+    vision_import_parser.add_argument("response")
     return parser
 
 
@@ -154,6 +172,59 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
             return 0
+        if args.command == "assess":
+            output = Path(args.output).expanduser().resolve()
+            report = assess_prepared(output)
+            print(
+                json.dumps(
+                    {
+                        "status": report["status"],
+                        "assets": report["assets"],
+                        "vision": report["vision"],
+                        "auto_reject_enabled": report["auto_reject_enabled"],
+                        "output": str(output),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0 if report["status"] == "completed" else 3
+        if args.command == "vision-request":
+            output = Path(args.output).expanduser().resolve()
+            request = create_vision_request_prepared(output)
+            print(
+                json.dumps(
+                    {
+                        "status": "pending",
+                        "request_id": request.request_id,
+                        "attempt": request.attempt,
+                        "assets": len(request.assets),
+                        "request": str(output / "vision-request.json"),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if args.command == "vision-import":
+            output = Path(args.output).expanduser().resolve()
+            response = Path(args.response).expanduser().resolve()
+            result = import_vision_response_prepared(output, response)
+            print(
+                json.dumps(
+                    {
+                        "status": result.status,
+                        "assets": len(result.assessments),
+                        "next_attempt": (
+                            result.next_request.attempt if result.next_request is not None else None
+                        ),
+                        "output": str(output),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0 if result.status == "completed" else 3
     except (FileNotFoundError, ValueError) as error:
         print(str(error), file=sys.stderr)
         return 2
