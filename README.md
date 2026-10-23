@@ -6,7 +6,7 @@ Silverloupe — проект проверяемого ассистированн
 
 ## Текущий статус
 
-**Реализованы контракты данных, deterministic eval-harness, диагностика окружения, read-only подготовка съёмки, консервативная группировка и recommendation-only техническая оценка с проверяемым host-vision exchange.** Жанровая редактура, итоговые `selects`/`top` и перенос разметки в редакторы пока не реализованы.
+**Реализованы контракты данных, deterministic eval-harness, диагностика окружения, read-only подготовка съёмки, консервативная группировка, recommendation-only техническая оценка с проверяемым host-vision exchange и жанровая редактура с наборами `selects` / `top`.** Перенос разметки в редакторы пока не реализован.
 
 | Возможность | Статус |
 |---|---|
@@ -22,7 +22,7 @@ Silverloupe — проект проверяемого ассистированн
 | Защищённые composite-наборы и единицы отбора | Готово |
 | Локальные технические сигналы и безопасный triage | Готово |
 | Проверяемый `vision-request` / `vision-import` | Готово |
-| Жанровая редактура и итоговые `selects` / `top` | Запланировано |
+| Жанровая редактура и итоговые `selects` / `top` | Готово (качество на реальных фото ещё не подтверждено) |
 | Отчёт, ручные исправления и перенос в редакторы | Запланировано |
 | Production-набор из шести скиллов и установщик | Запланировано |
 
@@ -158,6 +158,22 @@ uv run --locked silverloupe vision-import \
 
 Повторный `assess` сохраняет валидные визуальные свидетельства и решения с `decision_authority: "user"` / `user_override: true`. Если оригинал, превью, brief или render policy изменились, устаревшее vision-свидетельство сбрасывается, а `vision-status.json` получает `invalidated`. Код `0` возвращается только тогда, когда оценены все assets; наличие неподдерживаемого RAW сохраняет общий статус `partial` и код `3`.
 
+### Сформировать `selects` и `top`
+
+После оценки запустите жанровую редактуру:
+
+```bash
+uv run --locked silverloupe curate /path/to/silverloupe-output
+```
+
+Команда читает `Brief.genres`, загружает только известные профили `wedding`, `architecture` и `landscape`, сравнивает `SelectionItem` по нормированным свидетельствам и формирует широкий рабочий `selects` и упорядоченный `top`. Неизвестный жанр использует только нейтральные критерии и не получает свадебные или портретные правила.
+
+`top_k` считается по item IDs: защищённый HDR, panorama или focus stack занимает одно место, а его `required_asset_ids` сохраняются в provenance решения. `top_ids` всегда входит в `selects_ids`. Обязательное покрытие из `coverage_checklist`, недостаток кандидатов, конфликт coverage с K и ручной top сверх K записываются в `unmet_constraints`, а не скрываются подбором несуществующего результата. Штраф разнообразия уменьшает повторы из burst/near-duplicate групп, не превращая проигравшие варианты в технический reject.
+
+Решения с `decision_authority: "user"` или `user_override: true` имеют приоритет при повторном запуске. `curate` сохраняет их поля и членство top/select/reserve/none; forced top автоматически остаётся внутри selects. Три JSON-профиля версионированы отдельно, а соответствующие гайды в `resources/genres/` описывают художественные исключения и отрицательные примеры.
+
+Синтетические unit/eval-кейсы доказывают только контракт, детерминированность и обработку ограничений. Метрики burst-choice, nDCG и фотографического coverage остаются `unavailable`, пока нет разрешённых экспертных labels; утверждения о качестве свадебного, архитектурного или пейзажного отбора до фото-evals не делаются.
+
 Если output находится внутри исходной папки, он автоматически исключается из повторного scan. Output не может совпадать с source или быть его родительским каталогом. Silverloupe отклоняет симлинки на своих служебных путях до записи, чтобы генерация и очистка не могли затронуть оригиналы.
 
 Одинаковые имена и одинаковые байты в разных каталогах остаются отдельными assets; content hash хранится независимо. JPEG/PNG/TIFF/WebP и другие форматы Pillow получают нормализованное превью. RAW использует optional `rawpy`; без доступного декодера файл остаётся `unsupported/unassessed`, но не превращается в reject. Ключ кэша учитывает content hash, rendering policy, версию renderer и доступность RAW backend, а повреждённые превью автоматически пересоздаются при `resume`.
@@ -213,6 +229,9 @@ silverloupe-output/
 ├── assessment-generation.json # publishing / complete для согласованного snapshot
 ├── vision-request.json     # появляется после vision-request
 ├── vision-status.json      # pending / retry_required / completed / partial / invalidated
+├── selection.json          # item-level selects, ordered top, coverage и ограничения
+├── curation-report.json    # профили, counts и честный статус photo-eval
+├── curation-generation.json # publishing / complete для согласованного snapshot
 ├── previews/              # JPEG + provenance sidecars
 └── contact-sheets/
 ```
@@ -223,7 +242,7 @@ silverloupe-output/
 
 `grouping-report.json` показывает число кандидатов, типы групп и `review_group_ids`. Значение `real_photo_validation=unavailable` честно сохраняется, пока нет разрешённого пилотного набора; синтетические fixtures не объявляются доказательством совместимости конкретной камеры.
 
-`assessments.jsonl` хранит численные сигналы по каждому asset отдельно от visual evidence. Локальная дисперсия Лапласиана, яркость и высокочастотная энергия являются только baseline-сигналами: low/high key, grain, soft focus и motion blur остаются контекстными. `decisions.jsonl` содержит только proposal-решения `keep`, `review` или `unassessed`; `automatic_rejects` в отчёте равен нулю. `assessment-generation.json` записывается первым как `publishing` и последним как `complete`, поэтому прерванная публикация не читается как согласованный результат. Общие исключения описаны в [`resources/artistic-intent.md`](resources/artistic-intent.md).
+`assessments.jsonl` хранит численные сигналы по каждому asset отдельно от visual evidence. Локальная дисперсия Лапласиана, яркость и высокочастотная энергия являются только baseline-сигналами: low/high key, grain, soft focus и motion blur остаются контекстными. Этап `assess` создаёт только proposal-решения `keep`, `review` или `unassessed`; `automatic_rejects` в отчёте равен нулю. Затем `curate` обновляет `decisions.jsonl` item-level уровнями `top`, `select`, `reserve` или `none`, сохраняя пользовательские overrides. Оба этапа используют marker `publishing` → `complete`, поэтому прерванная публикация не читается как согласованный результат. Общие исключения описаны в [`resources/artistic-intent.md`](resources/artistic-intent.md), жанровые — в [`resources/genres/`](resources/genres/).
 
 ### Валидация полного run-контракта
 
@@ -322,8 +341,11 @@ README обязан отражать фактическое состояние �
 | `src/silverloupe/comparisons.py` | Бок-о-бок comparison batches |
 | `src/silverloupe/signals.py` | Консервативные численные сигналы по превью |
 | `src/silverloupe/triage.py` | Assessment, review-only decisions и артефакты CLI |
+| `src/silverloupe/curation.py` | Жанровые оценки, constrained selection и публикация `selects` / `top` |
 | `src/silverloupe/vision/` | Контракты и валидация host-vision exchange |
 | `resources/artistic-intent.md` | Общие художественные исключения для triage |
+| `resources/profiles/` | Версионированные веса и diversity policy жанров |
+| `resources/genres/` | Критерии, исключения, coverage и отрицательные примеры жанров |
 | `evals/runner.py` | Dev-only validation и deterministic graders |
 | `evals/contracts.py` | Dev-only `TrialResult` |
 | `evals/cases/` | Версионированные eval cases |
