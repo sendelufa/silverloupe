@@ -206,3 +206,9 @@ def load_run_config(output: Path) -> RunConfig:
         budget=session.budget,
         editor_config_snapshot=session.editor_config_snapshot,
     )
+
+
+def write_session_config(output: Path, session: SessionConfig) -> None:
+    """Atomically replace the persisted session contract."""
+
+    atomic_write_text(output / "session.json", session.model_dump_json(indent=2) + "\n")

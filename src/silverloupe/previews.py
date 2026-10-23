@@ -39,6 +39,9 @@ _OWNED_FILES = (
     "selection.json",
     "curation-report.json",
     "curation-generation.json",
+    "run-state.json",
+    "manual-overrides.jsonl",
+    "override-generation.json",
 )
 
 

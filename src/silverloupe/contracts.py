@@ -207,8 +207,35 @@ class RunConfig(ContractModel):
 class RunState(ContractModel):
     session_id: str
     status: Literal["completed", "partial", "failed"]
+    output_root: str
     artifact_paths: dict[str, str] = Field(default_factory=dict)
     errors: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def paths_are_output_owned(self) -> RunState:
+        if not Path(self.output_root).is_absolute():
+            raise ValueError("output_root must be absolute")
+        for name, value in self.artifact_paths.items():
+            path = Path(value)
+            if path.is_absolute() or ".." in path.parts:
+                raise ValueError(f"artifact path {name!r} must stay relative to output_root")
+        return self
+
+
+class SelectionOverride(ContractModel):
+    item_id: str = Field(min_length=1)
+    revision: int = Field(ge=1)
+    selection_scope: Literal["top", "selects"]
+    action: Literal["include", "exclude"]
+    reason: str = Field(min_length=1)
+
+    @field_validator("reason")
+    @classmethod
+    def reason_is_not_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("reason must not be blank")
+        return normalized
 
 
 class AssetMapping(ContractModel):
