@@ -14,16 +14,18 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from silverloupe import __version__
-from silverloupe.contracts import SCHEMA_VERSION, Brief, RunConfig
+from silverloupe.contracts import SCHEMA_VERSION, Brief, RunConfig, SelectionOverride, SessionConfig
 from silverloupe.curation import curate_prepared
 from silverloupe.grouping import group_prepared
 from silverloupe.inventory import prepare, resume
+from silverloupe.report import build_report
 from silverloupe.state import read_status
 from silverloupe.triage import (
     assess_prepared,
     create_vision_request_prepared,
     import_vision_response_prepared,
 )
+from silverloupe.workflow import apply_overrides, load_run_state, run_session
 
 
 def doctor_report() -> dict[str, Any]:
@@ -103,7 +105,44 @@ def _parser() -> argparse.ArgumentParser:
         "curate", help="build genre-aware selects and an ordered top"
     )
     curate_parser.add_argument("output")
+    run_parser = subparsers.add_parser("run", help="run the complete safe culling workflow")
+    run_parser.add_argument("source")
+    run_parser.add_argument("output")
+    run_parser.add_argument("--brief", required=True, help="path to a strict Brief JSON document")
+    report_parser = subparsers.add_parser("report", help="rebuild the static review report")
+    report_parser.add_argument("output")
+    overrides_parser = subparsers.add_parser(
+        "apply-overrides", help="apply revision-bound manual selection corrections"
+    )
+    overrides_parser.add_argument("output")
+    overrides_parser.add_argument("overrides")
     return parser
+
+
+def _brief(path: Path) -> Brief:
+    try:
+        return Brief.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError(f"invalid brief JSON: {error}") from error
+
+
+def _overrides(path: Path) -> list[SelectionOverride]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError(f"invalid overrides JSON: {error}") from error
+    if not isinstance(value, list):
+        raise ValueError("invalid overrides JSON: expected a JSON array")
+    try:
+        return [SelectionOverride.model_validate(item) for item in value]
+    except ValueError as error:
+        raise ValueError(f"invalid overrides JSON: {error}") from error
+
+
+def _session_revision(output: Path) -> int:
+    return SessionConfig.model_validate_json(
+        (output / "session.json").read_text(encoding="utf-8")
+    ).revision
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -242,6 +281,66 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "top": report["top"],
                         "unmet_constraints": report["unmet_constraints"],
                         "output": str(output),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if args.command == "run":
+            source = Path(args.source).expanduser().resolve()
+            output = Path(args.output).expanduser().resolve()
+            state = run_session(
+                RunConfig(
+                    source_roots=[str(source)],
+                    output_root=str(output),
+                    brief=_brief(Path(args.brief).expanduser().resolve()),
+                )
+            )
+            report_path = build_report(state)
+            print(
+                json.dumps(
+                    {
+                        "status": state.status,
+                        "session_id": state.session_id,
+                        "revision": _session_revision(output),
+                        "output": str(output),
+                        "report": str(report_path),
+                        "errors": state.errors,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0 if state.status == "completed" else 3
+        if args.command == "report":
+            output = Path(args.output).expanduser().resolve()
+            state = load_run_state(output)
+            report_path = build_report(state)
+            print(
+                json.dumps(
+                    {
+                        "status": state.status,
+                        "revision": _session_revision(output),
+                        "report": str(report_path),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0 if state.status == "completed" else 3
+        if args.command == "apply-overrides":
+            output = Path(args.output).expanduser().resolve()
+            state = apply_overrides(
+                output, _overrides(Path(args.overrides).expanduser().resolve())
+            )
+            report_path = build_report(state)
+            print(
+                json.dumps(
+                    {
+                        "status": state.status,
+                        "revision": _session_revision(output),
+                        "report": str(report_path),
                     },
                     ensure_ascii=False,
                     sort_keys=True,

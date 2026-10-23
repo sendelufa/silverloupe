@@ -22,7 +22,7 @@ RAW_EXTENSIONS = {
 }
 
 _RENDERER_VERSION = 2
-_OWNED_DIRECTORIES = ("previews", "contact-sheets")
+_OWNED_DIRECTORIES = ("previews", "contact-sheets", "report")
 _OWNED_FILES = (
     "assets.jsonl",
     "session.json",
@@ -42,6 +42,7 @@ _OWNED_FILES = (
     "run-state.json",
     "manual-overrides.jsonl",
     "override-generation.json",
+    "report-generation.json",
 )
 
 
