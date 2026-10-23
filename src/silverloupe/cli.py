@@ -15,6 +15,7 @@ from typing import Any, Sequence
 
 from silverloupe import __version__
 from silverloupe.contracts import SCHEMA_VERSION, Brief, RunConfig
+from silverloupe.grouping import group_prepared
 from silverloupe.inventory import prepare, resume
 from silverloupe.state import read_status
 
@@ -66,6 +67,13 @@ def _parser() -> argparse.ArgumentParser:
     status_parser.add_argument("output")
     resume_parser = subparsers.add_parser("resume", help="resume preparation from checkpoints")
     resume_parser.add_argument("output")
+    group_parser = subparsers.add_parser("group", help="group a prepared session")
+    group_parser.add_argument("output")
+    group_parser.add_argument(
+        "--reuse-groups",
+        action="store_true",
+        help="validate edited groups.json and rebuild selection items without regrouping",
+    )
     return parser
 
 
@@ -111,6 +119,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "status": "completed",
                         "assets": len(manifest.assets),
                         "unavailable": sum(asset.decode_status != "ready" for asset in manifest.assets),
+                        "output": str(output),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if args.command == "group":
+            output = Path(args.output).expanduser().resolve()
+            report = group_prepared(output, reuse_groups=args.reuse_groups)
+            print(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "assets": report["assets"],
+                        "groups": report["groups"],
+                        "selection_items": report["selection_items"],
+                        "review_groups": len(report["review_group_ids"]),
                         "output": str(output),
                     },
                     ensure_ascii=False,

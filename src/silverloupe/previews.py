@@ -23,7 +23,14 @@ RAW_EXTENSIONS = {
 
 _RENDERER_VERSION = 2
 _OWNED_DIRECTORIES = ("previews", "contact-sheets")
-_OWNED_FILES = ("assets.jsonl", "session.json", "state.sqlite3")
+_OWNED_FILES = (
+    "assets.jsonl",
+    "session.json",
+    "state.sqlite3",
+    "groups.json",
+    "selection-items.json",
+    "grouping-report.json",
+)
 
 
 class PreviewUnavailable(Exception):

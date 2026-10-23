@@ -1,0 +1,5 @@
+{"case_id":"raw-jpeg-companion","assets":["IMG_0042.CR2","IMG_0042.JPG"],"evidence":["same_camera","capture_time_within_1.5s","same_directory_stem"],"expected_group_types":["raw_jpeg_companion"],"expected_selection_items":1,"primary_kind":"raw"}
+{"case_id":"protected-hdr-five","assets":["H0.DNG","H1.DNG","H2.DNG","H3.DNG","H4.DNG"],"evidence":["same_camera","visual_similarity","five_distinct_exposures"],"expected_group_types":["hdr"],"protected_set":true,"expected_selection_items":1,"required_assets":5}
+{"case_id":"ambiguous-composite","assets":["A0.JPG","A1.JPG","A2.JPG"],"evidence":["conflicting_hdr_and_panorama_hints"],"expected_group_types":["uncertain"],"protected_set":false,"expected_selection_items":3}
+{"case_id":"false-same-stem","assets":["camera-a/IMG_0001.CR2","camera-a/IMG_0001.JPG"],"evidence":["different_camera_serials","capture_time_delta_24h"],"forbidden_group_types":["raw_jpeg_companion"],"expected_selection_items":2}
+{"case_id":"bounded-candidates-5000","asset_count":5000,"same_camera_and_timestamp":true,"max_neighbors":24,"maximum_candidate_comparisons":120000,"full_pairwise_comparisons":12497500}
