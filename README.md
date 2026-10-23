@@ -91,6 +91,12 @@ uv run --locked silverloupe group /path/to/silverloupe-output
 uv run --locked silverloupe group /path/to/silverloupe-output --reuse-groups
 ```
 
+Обычный повторный `group` сохраняет группы с `confidence_kind: "manual"` и пересчитывает только автоматические связи вокруг них. Чтобы намеренно удалить ручные исправления и начать автоматическую группировку заново, используйте явный сброс:
+
+```bash
+uv run --locked silverloupe group /path/to/silverloupe-output --reset-manual-groups
+```
+
 Пересекающиеся защищённые composite-группы команда отклонит: сначала конфликт нужно разрешить в `groups.json` или перевести связь в `uncertain`.
 
 Если output находится внутри исходной папки, он автоматически исключается из повторного scan. Output не может совпадать с source или быть его родительским каталогом. Silverloupe отклоняет симлинки на своих служебных путях до записи, чтобы генерация и очистка не могли затронуть оригиналы.

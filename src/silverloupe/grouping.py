@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import warnings
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -29,8 +31,34 @@ def _stable_id(prefix: str, kind: str, members: Iterable[str]) -> str:
 
 
 def _policy(config: RunConfig) -> dict[str, Any]:
-    value = config.budget.get("grouping_policy", {})
-    return value if isinstance(value, dict) else {}
+    raw = config.budget.get("grouping_policy", {})
+    if not isinstance(raw, dict):
+        raise ValueError("grouping_policy must be an object")
+
+    policy = dict(raw)
+    max_neighbors = policy.get("max_neighbors", _DEFAULT_MAX_NEIGHBORS)
+    if isinstance(max_neighbors, bool) or not isinstance(max_neighbors, int) or max_neighbors < 1:
+        raise ValueError("grouping_policy.max_neighbors must be an integer >= 1")
+    policy["max_neighbors"] = max_neighbors
+
+    numeric_limits = {
+        "max_time_seconds": (_DEFAULT_MAX_SECONDS, 0.0, None),
+        "burst_seconds": (_DEFAULT_BURST_SECONDS, 0.0, None),
+        "visual_similarity": (_DEFAULT_VISUAL_SIMILARITY, 0.0, 1.0),
+    }
+    for name, (default, minimum, maximum) in numeric_limits.items():
+        value = policy.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"grouping_policy.{name} must be a finite number")
+        normalized = float(value)
+        if not math.isfinite(normalized) or normalized < minimum:
+            raise ValueError(f"grouping_policy.{name} must be a finite number >= {minimum:g}")
+        if maximum is not None and normalized > maximum:
+            raise ValueError(
+                f"grouping_policy.{name} must be a finite number between {minimum:g} and {maximum:g}"
+            )
+        policy[name] = normalized
+    return policy
 
 
 def _capture_time(asset: Asset) -> datetime | None:
@@ -63,6 +91,16 @@ def _camera(asset: Asset) -> str | None:
     return "|".join(parts) if parts else None
 
 
+def _time_domain(value: datetime) -> str:
+    return "aware" if value.tzinfo is not None and value.utcoffset() is not None else "naive"
+
+
+def _time_delta_seconds(first: datetime, second: datetime) -> float | None:
+    if _time_domain(first) != _time_domain(second):
+        return None
+    return abs((first - second).total_seconds())
+
+
 def _number(value: Any) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
@@ -85,14 +123,14 @@ def _number(value: Any) -> float | None:
 
 def _candidate_pairs(manifest: Manifest, config: RunConfig) -> list[tuple[Asset, Asset, float]]:
     policy = _policy(config)
-    max_seconds = float(policy.get("max_time_seconds", _DEFAULT_MAX_SECONDS))
-    max_neighbors = max(1, int(policy.get("max_neighbors", _DEFAULT_MAX_NEIGHBORS)))
-    buckets: dict[str, list[tuple[datetime, Asset]]] = defaultdict(list)
+    max_seconds = policy["max_time_seconds"]
+    max_neighbors = policy["max_neighbors"]
+    buckets: dict[tuple[str, str], list[tuple[datetime, Asset]]] = defaultdict(list)
     for asset in manifest.assets:
         captured = _capture_time(asset)
         camera = _camera(asset)
         if captured is not None and camera is not None:
-            buckets[camera].append((captured, asset))
+            buckets[(camera, _time_domain(captured))].append((captured, asset))
 
     pairs: list[tuple[Asset, Asset, float]] = []
     for entries in buckets.values():
@@ -138,7 +176,13 @@ def _average_hash(asset: Asset, config: RunConfig, cache: dict[str, int | None])
     try:
         with Image.open(path) as opened:
             gray = ImageOps.grayscale(opened).resize((8, 8), Image.Resampling.LANCZOS)
-            pixels = list(gray.get_flattened_data())
+            flattened = getattr(gray, "get_flattened_data", None)
+            if flattened is not None:
+                pixels = list(flattened())
+            else:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    pixels = list(gray.getdata())
     except (Image.DecompressionBombError, OSError, UnidentifiedImageError):
         cache[asset.asset_id] = None
         return None
@@ -267,11 +311,7 @@ def _raw_jpeg_groups(manifest: Manifest) -> list[Group]:
         raw_time, raster_time = _capture_time(raw), _capture_time(raster)
         if raw_camera and raster_camera and raw_camera != raster_camera:
             continue
-        if raw_time and raster_time:
-            delta = abs((raw_time - raster_time).total_seconds())
-            if delta > 1.5:
-                continue
-        elif raw_camera is None or raster_camera is None:
+        if raw_camera is None or raster_camera is None or raw_time is None or raster_time is None:
             groups.append(
                 _group(
                     "uncertain",
@@ -283,8 +323,21 @@ def _raw_jpeg_groups(manifest: Manifest) -> list[Group]:
                 )
             )
             continue
-        else:
-            delta = None
+        delta = _time_delta_seconds(raw_time, raster_time)
+        if delta is None:
+            groups.append(
+                _group(
+                    "uncertain",
+                    [raw.asset_id, raster.asset_id],
+                    confidence_kind="unknown",
+                    confidence_value=None,
+                    protected_set=False,
+                    evidence=[{"kind": "same_stem_incomparable_timestamps", "stem": stem}],
+                )
+            )
+            continue
+        if delta > 1.5:
+            continue
         groups.append(
             _group(
                 "raw_jpeg_companion",
@@ -299,15 +352,36 @@ def _raw_jpeg_groups(manifest: Manifest) -> list[Group]:
 
 
 def _resolve_composite_conflicts(groups: list[Group]) -> list[Group]:
-    protected = [group for group in groups if group.protected_set]
-    conflicted: set[str] = set()
-    for index, first in enumerate(protected):
-        for second in protected[index + 1 :]:
-            if set(first.member_ids) & set(second.member_ids):
-                conflicted.update({first.group_id, second.group_id})
-    resolved: list[Group] = []
+    companion_adjacency: dict[str, set[str]] = defaultdict(set)
     for group in groups:
-        if group.group_id not in conflicted:
+        if group.type != "raw_jpeg_companion":
+            continue
+        for member in group.member_ids:
+            companion_adjacency[member].update(set(group.member_ids) - {member})
+
+    def expanded_members(group: Group) -> set[str]:
+        expanded = set(group.member_ids)
+        pending = list(expanded)
+        while pending:
+            member = pending.pop()
+            for companion in companion_adjacency.get(member, set()) - expanded:
+                expanded.add(companion)
+                pending.append(companion)
+        return expanded
+
+    protected = [
+        (index, group, expanded_members(group))
+        for index, group in enumerate(groups)
+        if group.protected_set and group.type in _COMPOSITE_TYPES
+    ]
+    conflicted: set[int] = set()
+    for position, (first_index, _first, first_members) in enumerate(protected):
+        for second_index, _second, second_members in protected[position + 1 :]:
+            if first_members & second_members:
+                conflicted.update({first_index, second_index})
+    resolved: list[Group] = []
+    for index, group in enumerate(groups):
+        if index not in conflicted:
             resolved.append(group)
             continue
         resolved.append(
@@ -356,8 +430,8 @@ def group_assets(manifest: Manifest, config: RunConfig) -> list[Group]:
     explicit_members = {member for group in explicit for member in group.member_ids}
 
     policy = _policy(config)
-    visual_threshold = float(policy.get("visual_similarity", _DEFAULT_VISUAL_SIMILARITY))
-    burst_seconds = float(policy.get("burst_seconds", _DEFAULT_BURST_SECONDS))
+    visual_threshold = policy["visual_similarity"]
+    burst_seconds = policy["burst_seconds"]
     hash_cache: dict[str, int | None] = {}
     temporal = _candidate_pairs(manifest, config)
     measured_edges: list[tuple[str, str, float, float]] = []
@@ -378,11 +452,15 @@ def group_assets(manifest: Manifest, config: RunConfig) -> list[Group]:
     similar_components = _components((first, second) for first, second, _delta, _similarity in measured_edges)
     for members in similar_components:
         component_assets = [assets_by_id[member] for member in members]
-        exposures = {_number(asset.exif.get("ExposureTime")) for asset in component_assets}
-        exposures.discard(None)
-        focus_distances = {_number(asset.exif.get("FocusDistance")) for asset in component_assets}
-        focus_distances.discard(None)
-        if len(members) >= 3 and len(exposures) >= 3:
+        exposure_values = [_number(asset.exif.get("ExposureTime")) for asset in component_assets]
+        exposures = {value for value in exposure_values if value is not None and value > 0}
+        focus_values = [_number(asset.exif.get("FocusDistance")) for asset in component_assets]
+        focus_distances = {value for value in focus_values if value is not None and value > 0}
+        complete_exposures = len(exposures) >= 3 and len(exposures) == len(component_assets)
+        complete_focus = len(focus_distances) >= 3 and len(focus_distances) == len(component_assets)
+        exposure_span = max(exposures) / min(exposures) if complete_exposures else None
+        focus_span = max(focus_distances) / min(focus_distances) if complete_focus else None
+        if len(members) >= 3 and exposure_span is not None and exposure_span >= 4.0:
             groups.append(
                 _group(
                     "hdr",
@@ -390,11 +468,17 @@ def group_assets(manifest: Manifest, config: RunConfig) -> list[Group]:
                     confidence_kind="measured",
                     confidence_value=0.9,
                     protected_set=True,
-                    evidence=[{"kind": "exposure_bracket", "distinct_exposures": len(exposures)}],
+                    evidence=[
+                        {
+                            "kind": "exposure_bracket",
+                            "distinct_exposures": len(exposures),
+                            "span_ratio": round(exposure_span, 4),
+                        }
+                    ],
                 )
             )
             protected_members.update(members)
-        elif len(members) >= 3 and len(focus_distances) >= 3:
+        elif len(members) >= 3 and focus_span is not None and focus_span >= 2.0:
             groups.append(
                 _group(
                     "focus_stack",
@@ -402,7 +486,34 @@ def group_assets(manifest: Manifest, config: RunConfig) -> list[Group]:
                     confidence_kind="measured",
                     confidence_value=0.9,
                     protected_set=True,
-                    evidence=[{"kind": "focus_bracket", "distinct_distances": len(focus_distances)}],
+                    evidence=[
+                        {
+                            "kind": "focus_bracket",
+                            "distinct_distances": len(focus_distances),
+                            "span_ratio": round(focus_span, 4),
+                        }
+                    ],
+                )
+            )
+            protected_members.update(members)
+        elif len(members) >= 3 and (complete_exposures or complete_focus):
+            candidate_type = "hdr" if complete_exposures else "focus_stack"
+            groups.append(
+                _group(
+                    "uncertain",
+                    members,
+                    confidence_kind="unknown",
+                    confidence_value=None,
+                    protected_set=False,
+                    evidence=[
+                        {
+                            "kind": "weak_composite_candidate",
+                            "candidate_type": candidate_type,
+                            "span_ratio": round(
+                                exposure_span if complete_exposures else focus_span or 0.0, 4
+                            ),
+                        }
+                    ],
                 )
             )
             protected_members.update(members)
@@ -492,6 +603,13 @@ def build_selection_items(manifest: Manifest, groups: list[Group]) -> list[Selec
 
     assets_by_id = {asset.asset_id: asset for asset in manifest.assets}
     manifest_order = {asset.asset_id: index for index, asset in enumerate(manifest.assets)}
+    group_ids = [group.group_id for group in groups]
+    duplicate_group_ids = sorted(
+        group_id for group_id in set(group_ids) if group_ids.count(group_id) > 1
+    )
+    if duplicate_group_ids:
+        raise ValueError(f"duplicate group_id values: {duplicate_group_ids}")
+
     groups_by_asset: dict[str, list[Group]] = defaultdict(list)
     for group in groups:
         for member in group.member_ids:
@@ -499,30 +617,48 @@ def build_selection_items(manifest: Manifest, groups: list[Group]) -> list[Selec
                 raise ValueError(f"group {group.group_id!r} references unknown asset {member!r}")
             groups_by_asset[member].append(group)
 
-    protected_memberships: dict[str, str] = {}
+    companion_adjacency: dict[str, set[str]] = defaultdict(set)
+    for group in groups:
+        if group.type != "raw_jpeg_companion":
+            continue
+        for member in group.member_ids:
+            companion_adjacency[member].update(set(group.member_ids) - {member})
+
+    expanded_protected: dict[str, set[str]] = {}
     for group in groups:
         if not group.protected_set or group.type not in _COMPOSITE_TYPES:
             continue
-        for member in group.member_ids:
+        members = set(group.member_ids)
+        pending = list(members)
+        while pending:
+            member = pending.pop()
+            for companion in companion_adjacency.get(member, set()) - members:
+                members.add(companion)
+                pending.append(companion)
+        expanded_protected[group.group_id] = members
+
+    protected_memberships: dict[str, str] = {}
+    for group_id, members in expanded_protected.items():
+        for member in members:
             previous = protected_memberships.get(member)
-            if previous is not None and previous != group.group_id:
+            if previous is not None and previous != group_id:
                 raise ValueError(
                     f"overlapping protected groups must be resolved before selection items: "
-                    f"{previous!r} and {group.group_id!r} share {member!r}"
+                    f"{previous!r} and {group_id!r} share {member!r}"
                 )
-            protected_memberships[member] = group.group_id
+            protected_memberships[member] = group_id
 
     items: list[SelectionItem] = []
     consumed: set[str] = set()
     raw_groups = [group for group in groups if group.type == "raw_jpeg_companion"]
     protected = [group for group in groups if group.protected_set and group.type in _COMPOSITE_TYPES]
     for group in sorted(protected, key=lambda value: value.group_id):
-        members = set(group.member_ids)
-        for companion in raw_groups:
-            if members & set(companion.member_ids):
-                members.update(companion.member_ids)
+        members = expanded_protected[group.group_id]
         if members & consumed:
-            continue
+            raise ValueError(
+                f"overlapping protected groups must be resolved before selection items: "
+                f"{group.group_id!r} reuses consumed assets"
+            )
         member_ids = sorted(members)
         attached_group_ids = {
             related.group_id for member in member_ids for related in groups_by_asset[member]
@@ -604,23 +740,68 @@ def _read_groups(output: Path) -> list[Group]:
     return [Group.model_validate(item) for item in value]
 
 
-def group_prepared(output: Path, *, reuse_groups: bool = False) -> dict[str, Any]:
+def _merge_manual_groups(
+    generated: list[Group], previous: list[Group], manifest: Manifest
+) -> tuple[list[Group], bool]:
+    manual = [group for group in previous if group.confidence_kind == "manual"]
+    if not manual:
+        return generated, False
+
+    known = {asset.asset_id for asset in manifest.assets}
+    reconciled: list[Group] = []
+    for group in manual:
+        members = sorted(set(group.member_ids) & known)
+        if not members:
+            continue
+        minimum = 3 if group.type == "hdr" else 2
+        if group.protected_set and group.type in _COMPOSITE_TYPES and len(members) < minimum:
+            reconciled.append(
+                group.model_copy(
+                    update={
+                        "type": "uncertain",
+                        "member_ids": members,
+                        "protected_set": False,
+                        "evidence": [
+                            *group.evidence,
+                            {"kind": "manual_group_incomplete", "candidate_type": group.type},
+                        ],
+                    }
+                )
+            )
+        else:
+            reconciled.append(group.model_copy(update={"member_ids": members}))
+
+    manual_members = {member for group in reconciled for member in group.member_ids}
+    retained_generated = [
+        group
+        for group in generated
+        if group.type == "byte_duplicate" or not (set(group.member_ids) & manual_members)
+    ]
+    merged = [*retained_generated, *reconciled]
+    return sorted(merged, key=lambda group: (group.member_ids[0], group.type, group.group_id)), bool(
+        reconciled
+    )
+
+
+def group_prepared(
+    output: Path, *, reuse_groups: bool = False, reset_manual_groups: bool = False
+) -> dict[str, Any]:
     """Group a prepared session and atomically write its contract artifacts."""
 
     output = output.expanduser().resolve()
     validate_output_layout(output)
     config = load_run_config(output)
+    _policy(config)
     manifest = _read_manifest(output)
-    groups = _read_groups(output) if reuse_groups else group_assets(manifest, config)
+    manual_preserved = False
+    if reuse_groups:
+        groups = _read_groups(output)
+    else:
+        groups = group_assets(manifest, config)
+        previous_path = output / "groups.json"
+        if previous_path.is_file() and not reset_manual_groups:
+            groups, manual_preserved = _merge_manual_groups(groups, _read_groups(output), manifest)
     items = build_selection_items(manifest, groups)
-    atomic_write_text(
-        output / "groups.json",
-        json.dumps([group.model_dump(mode="json") for group in groups], ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-    )
-    atomic_write_text(
-        output / "selection-items.json",
-        json.dumps([item.model_dump(mode="json") for item in items], ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-    )
     counts: dict[str, int] = defaultdict(int)
     for group in groups:
         counts[group.type] += 1
@@ -632,11 +813,35 @@ def group_prepared(output: Path, *, reuse_groups: bool = False) -> dict[str, Any
         "group_counts": dict(sorted(counts.items())),
         "candidate_comparisons": candidate_pair_count(manifest, config),
         "review_group_ids": [group.group_id for group in groups if group.type == "uncertain"],
-        "validation": "manual-groups-reused" if reuse_groups else "synthetic-or-user-review-required",
+        "validation": (
+            "manual-groups-reused"
+            if reuse_groups
+            else "manual-groups-preserved"
+            if manual_preserved
+            else "synthetic-or-user-review-required"
+        ),
         "real_photo_validation": "unavailable",
     }
-    atomic_write_text(
-        output / "grouping-report.json",
-        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-    )
+    artifacts = {
+        output / "groups.json": json.dumps(
+            [group.model_dump(mode="json") for group in groups],
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        output / "selection-items.json": json.dumps(
+            [item.model_dump(mode="json") for item in items],
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        output / "grouping-report.json": json.dumps(
+            report, ensure_ascii=False, indent=2, sort_keys=True
+        )
+        + "\n",
+    }
+    for path, contents in artifacts.items():
+        atomic_write_text(path, contents)
     return report

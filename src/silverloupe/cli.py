@@ -69,10 +69,16 @@ def _parser() -> argparse.ArgumentParser:
     resume_parser.add_argument("output")
     group_parser = subparsers.add_parser("group", help="group a prepared session")
     group_parser.add_argument("output")
-    group_parser.add_argument(
+    group_mode = group_parser.add_mutually_exclusive_group()
+    group_mode.add_argument(
         "--reuse-groups",
         action="store_true",
         help="validate edited groups.json and rebuild selection items without regrouping",
+    )
+    group_mode.add_argument(
+        "--reset-manual-groups",
+        action="store_true",
+        help="discard saved manual groups and replace them with automatic grouping",
     )
     return parser
 
@@ -128,7 +134,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "group":
             output = Path(args.output).expanduser().resolve()
-            report = group_prepared(output, reuse_groups=args.reuse_groups)
+            report = group_prepared(
+                output,
+                reuse_groups=args.reuse_groups,
+                reset_manual_groups=args.reset_manual_groups,
+            )
             print(
                 json.dumps(
                     {
