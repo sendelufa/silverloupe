@@ -10,6 +10,7 @@ from PIL import Image, UnidentifiedImageError
 from pydantic import ValidationError
 
 from silverloupe.contracts import Assessment, Brief, Manifest, RunConfig
+from silverloupe.curation import requested_editorial_criteria
 from silverloupe.signals import asset_input_fingerprint
 from silverloupe.vision.base import (
     VisionArtifact,
@@ -164,7 +165,9 @@ def build_vision_request(
             VisionRequestAsset(
                 asset_id=asset.asset_id,
                 artifact_ids=[artifact.artifact_id],
-                criteria=list(_CRITERIA),
+                criteria=list(
+                    dict.fromkeys([*_CRITERIA, *requested_editorial_criteria(brief)])
+                ),
             )
         )
         requested_asset_ids.append(asset.asset_id)
@@ -188,6 +191,7 @@ def build_vision_request(
             "Reference every inspected artifact by artifact_id; never infer a visual result from metadata alone.",
             "Treat blur, low/high key, grain, silhouettes, and closed eyes as context-dependent, not automatic failure.",
             "Use uncertainty when overview resolution is insufficient; request a future detail crop rather than guessing.",
+            "For coverage:<label> criteria, use acceptable only when visible evidence supports that checklist label.",
         ],
     )
 

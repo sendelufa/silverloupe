@@ -231,3 +231,30 @@ def test_interrupted_assessment_publication_is_marked_incomplete(
     assert marker["status"] == "publishing"
     with pytest.raises(ValueError, match="assessment generation is incomplete"):
         triage.create_vision_request_prepared(output)
+
+
+def test_reassessment_invalidates_complete_curation_before_republishing(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    preview = _save_preview(output, "rerun", Image.new("L", (800, 600), 128))
+    asset = _asset("rerun", preview=preview)
+    write_session(output, _config(output), "rerun-session")
+    (output / "assets.jsonl").write_text(asset.model_dump_json() + "\n", encoding="utf-8")
+    (output / "groups.json").write_text("[]\n", encoding="utf-8")
+    (output / "selection-items.json").write_text(
+        json.dumps([_item("rerun").model_dump(mode="json")]) + "\n",
+        encoding="utf-8",
+    )
+    triage.assess_prepared(output)
+    (output / "curation-generation.json").write_text(
+        json.dumps({"schema_version": 1, "status": "complete"}) + "\n",
+        encoding="utf-8",
+    )
+
+    triage.assess_prepared(output)
+
+    marker = json.loads((output / "curation-generation.json").read_text(encoding="utf-8"))
+    assert marker["status"] == "invalidated"
+    assert marker["reason"] == "assessment_changed"

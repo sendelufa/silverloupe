@@ -149,6 +149,8 @@ def test_nonfinite_or_malformed_score_evidence_is_ignored() -> None:
             "light": {"score": math.inf},
             "moment": {"unexpected": 1},
             "subject": [1, 2, 3],
+            "expression": 10**400,
+            "technical_usability": 1e308,
         },
     )
 
@@ -156,6 +158,37 @@ def test_nonfinite_or_malformed_score_evidence_is_ignored() -> None:
 
     assert scores[0].components == {"technical_readiness": 0.5}
     assert math.isfinite(scores[0].score)
+
+
+def test_curation_rejects_overlapping_items_and_unknown_item_groups() -> None:
+    manifest = Manifest(assets=[_asset("a"), _asset("b")])
+    group = Group(group_id="hdr-1", type="hdr", member_ids=["a", "b"])
+    composite = SelectionItem(
+        item_id="item-hdr",
+        kind="composite",
+        member_asset_ids=["a", "b"],
+        primary_asset_id="a",
+        required_asset_ids=["a", "b"],
+        group_ids=["hdr-1"],
+    )
+
+    with pytest.raises(ValueError, match="selection items overlap"):
+        score_items(
+            manifest,
+            [group],
+            [_item("a"), composite],
+            [_assessment("a"), _assessment("b")],
+            Brief(),
+        )
+
+    with pytest.raises(ValueError, match="selection items reference unknown groups"):
+        score_items(
+            manifest,
+            [group],
+            [_item("a").model_copy(update={"group_ids": ["missing"]})],
+            [_assessment("a")],
+            Brief(),
+        )
 
 
 def test_ties_are_stable_and_record_all_alternatives() -> None:
@@ -332,6 +365,102 @@ def test_diversity_penalty_prefers_distinct_item_over_second_burst_frame() -> No
     assert selection.ranked_ids[:2] == ["item-burst-a", "item-burst-b"]
 
 
+def test_manual_top_is_counted_by_automatic_diversity_selection() -> None:
+    manifest = Manifest(assets=[_asset("burst-a"), _asset("burst-b"), _asset("distinct")])
+    items = [_item("burst-a"), _item("burst-b"), _item("distinct")]
+    assessments = [
+        _assessment("burst-a", visual_criteria={"composition": 1.0}),
+        _assessment("burst-b", visual_criteria={"composition": 0.9}),
+        _assessment("distinct", visual_criteria={"composition": 0.4}),
+    ]
+    group = Group(group_id="burst-1", type="burst", member_ids=["burst-a", "burst-b"])
+
+    _decisions, selection = curate(
+        manifest,
+        [group],
+        items,
+        assessments,
+        Brief(top_k=2),
+        [_override("item-burst-a", tier=SelectionTier.TOP, rating=5)],
+    )
+
+    assert selection.top_ids == ["item-burst-a", "item-distinct"]
+
+
+def test_explicit_repetition_limit_is_enforced_by_group_id() -> None:
+    manifest = Manifest(assets=[_asset("a"), _asset("b"), _asset("c")])
+    items = [_item("a"), _item("b"), _item("c")]
+    assessments = [
+        _assessment("a", visual_criteria={"composition": 1.0}),
+        _assessment("b", visual_criteria={"composition": 0.9}),
+        _assessment("c", visual_criteria={"composition": 0.1}),
+    ]
+    group = Group(group_id="series", type="hdr", member_ids=["a", "b"])
+
+    _decisions, selection = curate(
+        manifest,
+        [group],
+        items,
+        assessments,
+        Brief(top_k=2, repetition_limits={"series": 1}),
+        [],
+    )
+
+    assert selection.top_ids == ["item-a", "item-c"]
+
+
+def test_unknown_repetition_limit_is_rejected() -> None:
+    manifest = Manifest(assets=[_asset("a")])
+
+    with pytest.raises(ValueError, match="unknown repetition-limit groups"):
+        curate(
+            manifest,
+            [],
+            [_item("a")],
+            [_assessment("a")],
+            Brief(top_k=1, repetition_limits={"missing": 1}),
+            [],
+        )
+
+
+def test_manual_repetition_limit_conflict_is_preserved_and_disclosed() -> None:
+    manifest = Manifest(assets=[_asset("a"), _asset("b")])
+    items = [_item("a"), _item("b")]
+    group = Group(group_id="series", type="hdr", member_ids=["a", "b"])
+
+    _decisions, selection = curate(
+        manifest,
+        [group],
+        items,
+        [_assessment("a"), _assessment("b")],
+        Brief(top_k=2, repetition_limits={"series": 1}),
+        [
+            _override("item-a", tier=SelectionTier.TOP, rating=5),
+            _override("item-b", tier=SelectionTier.TOP, rating=5),
+        ],
+    )
+
+    assert selection.top_ids == ["item-a", "item-b"]
+    assert "repetition_limit:series" in selection.unmet_constraints
+
+
+def test_repetition_limit_that_prevents_filling_k_is_disclosed() -> None:
+    manifest = Manifest(assets=[_asset("a"), _asset("b")])
+    group = Group(group_id="series", type="hdr", member_ids=["a", "b"])
+
+    _decisions, selection = curate(
+        manifest,
+        [group],
+        [_item("a"), _item("b")],
+        [_assessment("a"), _assessment("b")],
+        Brief(top_k=2, repetition_limits={"series": 1}),
+        [],
+    )
+
+    assert len(selection.top_ids) == 1
+    assert "repetition_limit:series" in selection.unmet_constraints
+
+
 def test_mandatory_coverage_is_selected_when_feasible() -> None:
     manifest = Manifest(assets=[_asset("ceremony"), _asset("portraits"), _asset("detail")])
     items = [_item("ceremony"), _item("portraits"), _item("detail")]
@@ -367,6 +496,57 @@ def test_mandatory_coverage_is_selected_when_feasible() -> None:
         },
     }
     assert selection.unmet_constraints == []
+
+
+def test_coverage_selection_repairs_greedy_choice_when_k_is_feasible() -> None:
+    labels = [str(value) for value in range(1, 7)]
+    manifest = Manifest(assets=[_asset("a"), _asset("b"), _asset("c")])
+    items = [_item("a"), _item("b"), _item("c")]
+    assessments = [
+        _assessment("a", visual_criteria={"coverage": ["1", "2", "3", "4"]}),
+        _assessment("b", visual_criteria={"coverage": ["1", "2", "5"]}),
+        _assessment("c", visual_criteria={"coverage": ["3", "4", "6"]}),
+    ]
+
+    _decisions, selection = curate(
+        manifest,
+        [],
+        items,
+        assessments,
+        Brief(top_k=2, coverage_checklist=labels),
+        [],
+    )
+
+    assert selection.top_ids == ["item-b", "item-c"]
+    assert selection.coverage["missing"] == []
+    assert "coverage_exceeds_top_k" not in selection.unmet_constraints
+
+
+def test_visual_concern_and_unique_moment_remain_review_reasons() -> None:
+    manifest = Manifest(assets=[_asset("a")])
+    item = _item("a")
+
+    decisions, selection = curate(
+        manifest,
+        [],
+        [item],
+        [
+            _assessment(
+                "a",
+                visual_criteria={
+                    "composition": "acceptable",
+                    "focus_on_relevant_subject": "concern",
+                },
+            )
+        ],
+        Brief(top_k=1, preselected_item_ids=[item.item_id]),
+        [],
+    )
+
+    assert selection.top_ids == [item.item_id]
+    assert decisions[0].status == DecisionStatus.REVIEW
+    assert "visual_focus_on_relevant_subject_concern" in decisions[0].reason_codes
+    assert "unique_moment" in decisions[0].reason_codes
 
 
 def test_missing_coverage_and_coverage_vs_k_conflict_are_disclosed() -> None:

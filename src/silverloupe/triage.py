@@ -337,6 +337,27 @@ def _publish_assessment_artifacts(
     decisions: list[Decision],
     report: dict[str, Any],
 ) -> None:
+    curation_marker = output / "curation-generation.json"
+    if curation_marker.is_file():
+        previous: dict[str, Any] = {}
+        try:
+            loaded = json.loads(curation_marker.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                previous = loaded
+        except (OSError, ValueError):
+            pass
+        previous.update(
+            {
+                "schema_version": 1,
+                "status": "invalidated",
+                "reason": "assessment_changed",
+            }
+        )
+        atomic_write_text(
+            curation_marker,
+            json.dumps(previous, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n",
+        )
     artifacts = {
         output / "assessments.jsonl": _jsonl(assessments),
         output / "decisions.jsonl": _jsonl(decisions),

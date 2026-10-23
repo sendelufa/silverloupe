@@ -30,6 +30,9 @@ dev = [
 where = ["src"]
 namespaces = true
 
+[tool.setuptools.package-data]
+silverloupe = ["resources/profiles/*.json"]
+
 [tool.pytest.ini_options]
 addopts = "--strict-markers --strict-config"
 pythonpath = ["src", "."]

@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "profile_version": "1.0.0",
+  "genre": "landscape",
+  "criteria_weights": {
+    "atmosphere": 1.6,
+    "light": 1.5,
+    "depth": 1.3,
+    "tonal_relationships": 1.2,
+    "structure": 1.1,
+    "composition": 1.1,
+    "artistic_intent": 1.0,
+    "technical_usability": 0.7
+  },
+  "diversity_penalty": 1.1,
+  "artistic_exceptions": [
+    "Fog, silhouettes, minimalism, and long-exposure water may intentionally reduce local contrast.",
+    "Intentional camera movement can trade literal sharpness for expressive structure."
+  ],
+  "negative_examples": [
+    "Do not reject every low-contrast scene as flat.",
+    "Do not treat all motion blur as camera failure."
+  ]
+}

@@ -9,6 +9,7 @@ from PIL import Image
 from pydantic import ValidationError
 
 from silverloupe.cli import main
+from silverloupe.curation import curate
 from silverloupe.contracts import (
     Assessment,
     Asset,
@@ -21,6 +22,7 @@ from silverloupe.contracts import (
     SelectionItem,
 )
 from silverloupe.state import write_session
+from silverloupe.triage import assess
 from silverloupe.vision.base import VisionObservation, VisionResponse
 from silverloupe.vision.host_exchange import (
     apply_vision_response,
@@ -88,6 +90,50 @@ def test_request_contains_stable_output_relative_observed_artifact(tmp_path: Pat
     assert first.artifacts[0].asset_id == "a"
     assert first.artifacts[0].path == "previews/a.jpg"
     assert first.assets[0].artifact_ids == [first.artifacts[0].artifact_id]
+
+
+def test_genre_and_coverage_evidence_round_trip_into_curation(tmp_path: Path) -> None:
+    relative = "previews/a.jpg"
+    preview = tmp_path / relative
+    preview.parent.mkdir(parents=True)
+    Image.new("RGB", (800, 600), "gray").save(preview, "JPEG")
+    brief = Brief(
+        genres=["architecture"],
+        top_k=1,
+        coverage_checklist=["facade"],
+    )
+    config = _config(tmp_path).model_copy(update={"brief": brief})
+    manifest = Manifest(assets=[_asset("a", relative)])
+    assessments = assess(manifest, [], brief, config)
+    request = build_vision_request(manifest, assessments, brief, config)
+
+    assert "geometry" in request.assets[0].criteria
+    assert "coverage:facade" in request.assets[0].criteria
+    response = VisionResponse(
+        request_id=request.request_id,
+        status="completed",
+        observations=[
+            VisionObservation(
+                asset_id="a",
+                observed_artifact_ids=[request.artifacts[0].artifact_id],
+                visual_criteria=_complete_criteria(request),
+            )
+        ],
+    )
+    imported = apply_vision_response(request, response, assessments)
+    item = SelectionItem(
+        item_id="item-a",
+        kind="capture",
+        member_asset_ids=["a"],
+        primary_asset_id="a",
+    )
+    _decisions, selection = curate(
+        manifest, [], [item], imported.assessments, brief, []
+    )
+
+    assert imported.assessments[0].visual_criteria["geometry"] == "acceptable"
+    assert selection.top_ids == ["item-a"]
+    assert selection.coverage["satisfied"] == ["facade"]
 
 
 def test_fake_observed_artifact_id_is_rejected(tmp_path: Path) -> None:
@@ -416,6 +462,10 @@ def test_cli_vision_round_trip_rejects_invalid_then_imports_valid_response(
         ),
         encoding="utf-8",
     )
+    (output / "curation-generation.json").write_text(
+        json.dumps({"schema_version": 1, "status": "complete"}) + "\n",
+        encoding="utf-8",
+    )
 
     assert main(["vision-import", str(output), str(valid_path)]) == 0
     summary = json.loads(capsys.readouterr().out)
@@ -424,6 +474,13 @@ def test_cli_vision_round_trip_rejects_invalid_then_imports_valid_response(
     )
     assert summary["status"] == "completed"
     assert imported.visual_status == "evaluated"
+    assert json.loads(
+        (output / "curation-generation.json").read_text(encoding="utf-8")
+    )["status"] == "invalidated"
+    (output / "curation-generation.json").write_text(
+        json.dumps({"schema_version": 1, "status": "complete"}) + "\n",
+        encoding="utf-8",
+    )
 
     user_decision = Decision(
         item_id="item-a",
@@ -447,6 +504,9 @@ def test_cli_vision_round_trip_rejects_invalid_then_imports_valid_response(
     assert preserved_assessment.visual_status == "evaluated"
     assert preserved_decision.decision_authority == DecisionAuthority.USER
     assert preserved_decision.user_override is True
+    assert json.loads(
+        (output / "curation-generation.json").read_text(encoding="utf-8")
+    )["status"] == "invalidated"
 
     Image.new("RGB", (800, 600), "black").save(preview, "JPEG")
     assert main(["assess", str(output)]) == 3

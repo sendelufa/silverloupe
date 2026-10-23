@@ -7,6 +7,7 @@ import json
 import math
 from collections import defaultdict
 from dataclasses import dataclass
+from importlib.resources import files
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
@@ -52,6 +53,14 @@ _GENERIC_WEIGHTS = {
     "significant_region_exposure": 0.5,
     "accidental_subject_occlusion": 0.5,
 }
+_GENERIC_EDITORIAL_CRITERIA = (
+    "subject",
+    "composition",
+    "light",
+    "artistic_intent",
+    "technical_usability",
+)
+_NUMERIC_ONLY_CRITERIA = {"repair_cost"}
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
@@ -87,16 +96,14 @@ class ItemScore:
     diversity_penalty: float
 
 
-def _resource_root() -> Path:
-    return Path(__file__).resolve().parents[2] / "resources"
-
-
 def _load_profiles(brief: Brief) -> list[_GenreProfile]:
     profiles: list[_GenreProfile] = []
     for genre in dict.fromkeys(value.strip().casefold() for value in brief.genres):
         if genre not in _KNOWN_GENRES:
             continue
-        path = _resource_root() / "profiles" / f"{genre}.json"
+        path = files("silverloupe.resources").joinpath(
+            "profiles", f"{genre}.json"
+        )
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
             profile = _GenreProfile.model_validate(value)
@@ -110,6 +117,24 @@ def _load_profiles(brief: Brief) -> list[_GenreProfile]:
             )
         profiles.append(profile)
     return profiles
+
+
+def requested_editorial_criteria(brief: Brief) -> list[str]:
+    """Return categorical editorial evidence keys for the host-vision exchange."""
+
+    criteria = list(_GENERIC_EDITORIAL_CRITERIA)
+    for profile in _load_profiles(brief):
+        criteria.extend(
+            criterion
+            for criterion in profile.criteria_weights
+            if criterion not in _NUMERIC_ONLY_CRITERIA
+        )
+    criteria.extend(
+        f"coverage:{label.strip().casefold()}"
+        for label in brief.coverage_checklist
+        if label.strip()
+    )
+    return list(dict.fromkeys(criteria))
 
 
 def _duplicates(values: list[str]) -> list[str]:
@@ -165,6 +190,30 @@ def _validate_inputs(
         raise ValueError(
             f"selection items reference unknown assets: {unknown_item_assets}"
         )
+    known_group_ids = {group.group_id for group in groups}
+    unknown_item_groups = sorted(
+        {
+            group_id
+            for item in items
+            for group_id in item.group_ids
+            if group_id not in known_group_ids
+        }
+    )
+    if unknown_item_groups:
+        raise ValueError(
+            f"selection items reference unknown groups: {unknown_item_groups}"
+        )
+    item_owners: dict[str, list[str]] = defaultdict(list)
+    for item in items:
+        for asset_id in item.member_asset_ids:
+            item_owners[asset_id].append(item.item_id)
+    overlapping = {
+        asset_id: sorted(owner_ids)
+        for asset_id, owner_ids in item_owners.items()
+        if len(owner_ids) > 1
+    }
+    if overlapping:
+        raise ValueError(f"selection items overlap on assets: {overlapping}")
     unknown_assessment_assets = sorted(
         assessment.asset_id
         for assessment in assessments
@@ -183,8 +232,15 @@ def _criterion_value(value: Any) -> float | None:
     if isinstance(candidate, bool):
         return None
     if isinstance(candidate, (int, float)):
-        normalized = float(candidate)
-        return normalized if math.isfinite(normalized) else None
+        try:
+            normalized = float(candidate)
+        except (OverflowError, TypeError, ValueError):
+            return None
+        return (
+            normalized
+            if math.isfinite(normalized) and -1.0 <= normalized <= 1.0
+            else None
+        )
     if isinstance(candidate, str):
         return _CATEGORY_SCORES.get(candidate.strip().casefold())
     return None
@@ -238,13 +294,13 @@ def _raw_item_scores(
                     values_by_criterion[criterion].append(normalized)
 
         components = {
-            criterion: sum(values) / len(values)
+            criterion: math.fsum(values) / len(values)
             for criterion, values in sorted(values_by_criterion.items())
         }
         components["technical_readiness"] = (
             sum(readiness) / len(readiness) if readiness else -0.5
         )
-        score = components["technical_readiness"] + sum(
+        score = components["technical_readiness"] + math.fsum(
             weights[criterion] * value
             for criterion, value in components.items()
             if criterion in weights
@@ -338,6 +394,14 @@ def _coverage_labels(
                 for candidate in candidates
                 if candidate.strip()
             )
+        labels.update(
+            key.removeprefix("coverage:").strip().casefold()
+            for key, value in assessment.visual_criteria.items()
+            if key.startswith("coverage:")
+            and isinstance(value, str)
+            and value.strip().casefold() == "acceptable"
+            and key.removeprefix("coverage:").strip()
+        )
     return labels
 
 
@@ -356,22 +420,66 @@ def _competitive_groups_by_item(
     return result
 
 
+def _groups_by_item(
+    groups: list[Group], items: list[SelectionItem]
+) -> dict[str, set[str]]:
+    item_members = {item.item_id: set(item.member_asset_ids) for item in items}
+    result: dict[str, set[str]] = defaultdict(set)
+    for group in groups:
+        members = set(group.member_ids)
+        for item_id, asset_ids in item_members.items():
+            if members & asset_ids:
+                result[item_id].add(group.group_id)
+    return result
+
+
+def _validate_repetition_limits(brief: Brief, groups: list[Group]) -> None:
+    known = {group.group_id for group in groups}
+    unknown = sorted(set(brief.repetition_limits) - known)
+    if unknown:
+        raise ValueError(f"unknown repetition-limit groups: {unknown}")
+    invalid = sorted(
+        group_id
+        for group_id, limit in brief.repetition_limits.items()
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0
+    )
+    if invalid:
+        raise ValueError(
+            f"repetition limits must be non-negative integers: {invalid}"
+        )
+
+
 def _choose_top(
     eligible_scores: list[ItemScore],
     k: int,
     required_labels: list[str],
     coverage_by_item: dict[str, set[str]],
     competitive_groups: dict[str, set[str]],
+    groups_by_item: dict[str, set[str]],
+    initial_group_counts: dict[str, int],
+    repetition_limits: dict[str, int],
 ) -> list[str]:
     remaining = {value.item_id: value for value in eligible_scores}
     selected: list[str] = []
     uncovered = set(required_labels)
-    selected_groups: set[str] = set()
+    selected_groups = {
+        group_id for group_id, count in initial_group_counts.items() if count > 0
+    }
+    group_counts = defaultdict(int, initial_group_counts)
+
+    def allowed(item_id: str, counts: dict[str, int]) -> bool:
+        return all(
+            counts.get(group_id, 0) < repetition_limits[group_id]
+            for group_id in groups_by_item.get(item_id, set())
+            if group_id in repetition_limits
+        )
+
     while remaining and len(selected) < k:
         covering = [
             value
             for value in remaining.values()
             if coverage_by_item[value.item_id] & uncovered
+            and allowed(value.item_id, group_counts)
         ]
         if covering:
             chosen = min(
@@ -383,8 +491,15 @@ def _choose_top(
                 ),
             )
         else:
+            allowed_values = [
+                value
+                for value in remaining.values()
+                if allowed(value.item_id, group_counts)
+            ]
+            if not allowed_values:
+                break
             chosen = min(
-                remaining.values(),
+                allowed_values,
                 key=lambda value: (
                     -(
                         value.score
@@ -400,14 +515,66 @@ def _choose_top(
         selected.append(chosen.item_id)
         uncovered -= coverage_by_item[chosen.item_id]
         selected_groups.update(competitive_groups.get(chosen.item_id, set()))
+        for group_id in groups_by_item.get(chosen.item_id, set()):
+            group_counts[group_id] += 1
         del remaining[chosen.item_id]
+
+    score_by_id = {value.item_id: value.score for value in eligible_scores}
+    required = set(required_labels)
+    while selected:
+        current_coverage = {
+            label
+            for item_id in selected
+            for label in coverage_by_item[item_id]
+            if label in required
+        }
+        best: tuple[int, float, tuple[str, ...], list[str]] | None = None
+        selected_set = set(selected)
+        for removed_id in selected:
+            for added_id in score_by_id.keys() - selected_set:
+                replacement = [
+                    added_id if item_id == removed_id else item_id
+                    for item_id in selected
+                ]
+                counts = defaultdict(int, initial_group_counts)
+                for item_id in replacement:
+                    for group_id in groups_by_item.get(item_id, set()):
+                        counts[group_id] += 1
+                if any(
+                    counts[group_id] > limit
+                    for group_id, limit in repetition_limits.items()
+                ):
+                    continue
+                covered = {
+                    label
+                    for item_id in replacement
+                    for label in coverage_by_item[item_id]
+                    if label in required
+                }
+                if len(covered) <= len(current_coverage):
+                    continue
+                candidate = (
+                    len(covered),
+                    math.fsum(score_by_id[item_id] for item_id in replacement),
+                    tuple(sorted(replacement)),
+                    replacement,
+                )
+                if best is None or candidate[:2] > best[:2] or (
+                    candidate[:2] == best[:2] and candidate[2] < best[2]
+                ):
+                    best = candidate
+        if best is None:
+            break
+        selected = best[3]
     selected_set = set(selected)
     return [value.item_id for value in eligible_scores if value.item_id in selected_set]
 
 
 def _item_status(
-    item: SelectionItem, assessments_by_asset: dict[str, Assessment]
-) -> DecisionStatus:
+    item: SelectionItem,
+    assessments_by_asset: dict[str, Assessment],
+    brief: Brief,
+) -> tuple[DecisionStatus, list[str]]:
     member_assessments = [
         assessments_by_asset[asset_id]
         for asset_id in item.member_asset_ids
@@ -417,13 +584,34 @@ def _item_status(
         assessment.evaluation_status == "unassessed"
         for assessment in member_assessments
     ):
-        return DecisionStatus.UNASSESSED
-    if len(member_assessments) != len(item.member_asset_ids) or any(
-        assessment.uncertainty or assessment.visual_status != "evaluated"
-        for assessment in member_assessments
-    ):
-        return DecisionStatus.REVIEW
-    return DecisionStatus.KEEP
+        status = DecisionStatus.UNASSESSED
+        reasons = ["technical_evidence_unavailable"]
+    else:
+        reasons = [
+            reason
+            for assessment in member_assessments
+            for reason in assessment.uncertainty
+        ]
+        reasons.extend(
+            f"visual_{criterion}_{normalized}"
+            for assessment in member_assessments
+            for criterion, value in assessment.visual_criteria.items()
+            if (normalized := str(value).strip().casefold())
+            in {"concern", "uncertain", "insufficient_evidence"}
+        )
+        if len(member_assessments) != len(item.member_asset_ids):
+            reasons.append("technical_evidence_unavailable")
+        if any(
+            assessment.visual_status != "evaluated"
+            for assessment in member_assessments
+        ):
+            reasons.append("visual_evidence_incomplete")
+        status = DecisionStatus.REVIEW if reasons else DecisionStatus.KEEP
+    if item.item_id in brief.preselected_item_ids:
+        reasons.append("unique_moment")
+        if status != DecisionStatus.UNASSESSED:
+            status = DecisionStatus.REVIEW
+    return status, sorted(set(reasons))
 
 
 def _generated_decision(
@@ -431,6 +619,7 @@ def _generated_decision(
     item_score: ItemScore,
     status: DecisionStatus,
     tier: SelectionTier,
+    review_reasons: list[str],
 ) -> Decision:
     rating = {
         SelectionTier.TOP: 5,
@@ -449,11 +638,15 @@ def _generated_decision(
         status=status,
         tier=tier,
         rating_proposal=rating,
-        reason_codes=[reason],
+        reason_codes=list(dict.fromkeys([reason, *review_reasons])),
         human_reason=(
-            "Comparative curation proposal; the score is relative and uncalibrated."
-            if tier != SelectionTier.NONE
-            else "The available evidence is insufficient for selection."
+            "Editorial tier proposed, but technical or visual concerns still require review."
+            if status == DecisionStatus.REVIEW
+            else (
+                "Comparative curation proposal; the score is relative and uncalibrated."
+                if tier != SelectionTier.NONE
+                else "The available evidence is insufficient for selection."
+            )
         ),
         group_ids=list(item.group_ids),
         provenance={
@@ -481,6 +674,7 @@ def curate(
 ) -> tuple[list[Decision], Selection]:
     """Build broad selects and an ordered top from item-level evidence."""
 
+    _validate_repetition_limits(brief, groups)
     scores = score_items(manifest, groups, items, assessments, brief)
     scores_by_id = {value.item_id: value for value in scores}
     items_by_id = {item.item_id: item for item in items}
@@ -509,8 +703,12 @@ def curate(
     assessments_by_asset = {
         assessment.asset_id: assessment for assessment in assessments
     }
+    status_and_reasons = {
+        item.item_id: _item_status(item, assessments_by_asset, brief)
+        for item in items
+    }
     statuses = {
-        item.item_id: _item_status(item, assessments_by_asset) for item in items
+        item_id: status for item_id, (status, _reasons) in status_and_reasons.items()
     }
     automatic_select_ids = [
         value.item_id
@@ -558,12 +756,20 @@ def curate(
         if brief.top_k is None
         else max(brief.top_k - len(ordered_forced_top), 0)
     )
+    all_groups_by_item = _groups_by_item(groups, items)
+    initial_group_counts: dict[str, int] = defaultdict(int)
+    for item_id in ordered_forced_top:
+        for group_id in all_groups_by_item.get(item_id, set()):
+            initial_group_counts[group_id] += 1
     automatic_top_ids = _choose_top(
         [scores_by_id[item_id] for item_id in automatic_select_ids],
         automatic_capacity,
         remaining_required,
         coverage_by_item,
         _competitive_groups_by_item(groups, items),
+        all_groups_by_item,
+        dict(initial_group_counts),
+        brief.repetition_limits,
     )
     top_members = set(ordered_forced_top) | set(automatic_top_ids)
     top_ids = [value.item_id for value in scores if value.item_id in top_members]
@@ -582,6 +788,24 @@ def curate(
         unmet_constraints.append("insufficient_qualified_items")
     if brief.top_k is not None and len(ordered_forced_top) > brief.top_k:
         unmet_constraints.append("manual_top_exceeds_top_k")
+    top_group_counts: dict[str, int] = defaultdict(int)
+    for item_id in top_ids:
+        for group_id in all_groups_by_item.get(item_id, set()):
+            top_group_counts[group_id] += 1
+    for group_id, limit in sorted(brief.repetition_limits.items()):
+        blocked_qualified = any(
+            item_id not in top_members
+            and item_id in select_members
+            and group_id in all_groups_by_item.get(item_id, set())
+            for item_id in items_by_id
+        )
+        if top_group_counts[group_id] > limit or (
+            brief.top_k is not None
+            and len(top_ids) < brief.top_k
+            and top_group_counts[group_id] >= limit
+            and blocked_qualified
+        ):
+            unmet_constraints.append(f"repetition_limit:{group_id}")
     covered_labels = {
         label
         for item_id in top_ids
@@ -621,7 +845,11 @@ def curate(
             tier = SelectionTier.RESERVE
         decisions.append(
             _generated_decision(
-                items_by_id[item_id], value, statuses[item_id], tier
+                items_by_id[item_id],
+                value,
+                statuses[item_id],
+                tier,
+                status_and_reasons[item_id][1],
             )
         )
 

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "profile_version": "1.0.0",
+  "genre": "architecture",
+  "criteria_weights": {
+    "geometry": 1.6,
+    "space": 1.4,
+    "material": 1.2,
+    "composition": 1.2,
+    "light": 1.1,
+    "technical_usability": 0.9,
+    "repair_cost": -0.6
+  },
+  "diversity_penalty": 1.0,
+  "artistic_exceptions": [
+    "Converging verticals can be intentional in an expressive perspective.",
+    "Abstract details may be essential even when they do not show the whole building."
+  ],
+  "negative_examples": [
+    "Do not mark every non-parallel vertical as a defect.",
+    "Do not discard a protected HDR or panorama because one source is weak alone."
+  ]
+}
