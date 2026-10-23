@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "profile_version": "1.0.0",
+  "genre": "wedding",
+  "criteria_weights": {
+    "moment": 1.7,
+    "expression": 1.6,
+    "interaction": 1.4,
+    "subject": 1.1,
+    "composition": 1.0,
+    "light": 0.9,
+    "technical_usability": 0.8,
+    "eye_state_when_contextually_relevant": 0.4
+  },
+  "diversity_penalty": 1.25,
+  "artistic_exceptions": [
+    "Closed eyes during a kiss or embrace can support the moment rather than invalidate it.",
+    "Dance motion can be expressive when the subject and intent remain readable."
+  ],
+  "negative_examples": [
+    "Do not reject every closed-eye frame without considering the action.",
+    "Do not infer identities or family relationships from faces."
+  ]
+}
