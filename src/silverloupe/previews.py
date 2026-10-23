@@ -36,6 +36,9 @@ _OWNED_FILES = (
     "assessment-generation.json",
     "vision-request.json",
     "vision-status.json",
+    "selection.json",
+    "curation-report.json",
+    "curation-generation.json",
 )
 
 

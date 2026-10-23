@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+from pathlib import Path
 
 import pytest
 
@@ -14,10 +16,14 @@ from silverloupe.contracts import (
     DecisionStatus,
     Group,
     Manifest,
+    RunConfig,
     SelectionItem,
     SelectionTier,
 )
-from silverloupe.curation import curate, score_items
+from silverloupe import curation
+from silverloupe.cli import main
+from silverloupe.curation import curate, curate_prepared, score_items
+from silverloupe.state import write_session
 
 
 def _asset(asset_id: str) -> Asset:
@@ -499,3 +505,147 @@ def test_manual_top_beyond_k_is_preserved_and_disclosed() -> None:
     assert selection.top_ids == ["item-a", "item-b"]
     assert set(selection.top_ids).issubset(selection.selects_ids)
     assert "manual_top_exceeds_top_k" in selection.unmet_constraints
+
+
+def _write_prepared_curation_run(
+    output: Path,
+    *,
+    assessment_generation_status: str = "complete",
+    groups_value: object | None = None,
+) -> Decision:
+    output.mkdir(parents=True)
+    asset = _asset("a")
+    item = _item("a")
+    assessment = _assessment(
+        "a",
+        visual_criteria={"moment": 1.0, "coverage": ["ceremony"]},
+    )
+    override = _override("item-a", tier=SelectionTier.TOP, rating=5)
+    write_session(
+        output,
+        RunConfig(
+            source_roots=[str(output / "source")],
+            output_root=str(output),
+            brief=Brief(
+                genres=["wedding"],
+                top_k=1,
+                coverage_checklist=["ceremony"],
+            ),
+        ),
+        "curation-session",
+    )
+    (output / "assets.jsonl").write_text(
+        asset.model_dump_json() + "\n", encoding="utf-8"
+    )
+    (output / "groups.json").write_text(
+        json.dumps([] if groups_value is None else groups_value) + "\n",
+        encoding="utf-8",
+    )
+    (output / "selection-items.json").write_text(
+        json.dumps([item.model_dump(mode="json")]) + "\n", encoding="utf-8"
+    )
+    (output / "assessments.jsonl").write_text(
+        assessment.model_dump_json() + "\n", encoding="utf-8"
+    )
+    (output / "decisions.jsonl").write_text(
+        override.model_dump_json() + "\n", encoding="utf-8"
+    )
+    (output / "assessment-generation.json").write_text(
+        json.dumps(
+            {"schema_version": 1, "status": assessment_generation_status}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return override
+
+
+def test_cli_curate_publishes_snapshot_from_another_cwd_and_preserves_user_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "output"
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    override = _write_prepared_curation_run(output)
+    monkeypatch.chdir(elsewhere)
+
+    assert main(["curate", str(output)]) == 0
+    summary = json.loads(capsys.readouterr().out)
+
+    assert summary == {
+        "items": 1,
+        "output": str(output),
+        "selects": 1,
+        "status": "completed",
+        "top": 1,
+        "unmet_constraints": [],
+    }
+    decisions = [
+        Decision.model_validate_json(line)
+        for line in (output / "decisions.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert decisions == [override]
+    selection = json.loads((output / "selection.json").read_text(encoding="utf-8"))
+    assert selection["top_ids"] == ["item-a"]
+    report = json.loads((output / "curation-report.json").read_text(encoding="utf-8"))
+    assert report["profile_versions"] == {"wedding": "1.0.0"}
+    assert report["photo_eval_status"] == "unavailable"
+    assert report["photo_metrics"] == {
+        "burst_choice": "unavailable",
+        "coverage": "unavailable",
+        "ndcg": "unavailable",
+    }
+    generation = json.loads(
+        (output / "curation-generation.json").read_text(encoding="utf-8")
+    )
+    assert generation["status"] == "complete"
+
+
+def test_curate_prepared_requires_complete_assessment_generation(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    _write_prepared_curation_run(output, assessment_generation_status="publishing")
+
+    with pytest.raises(ValueError, match="assessment generation is incomplete"):
+        curate_prepared(output)
+
+    assert not (output / "curation-generation.json").exists()
+
+
+def test_curate_prepared_validates_all_inputs_before_publication(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    _write_prepared_curation_run(output, groups_value={"not": "an array"})
+
+    with pytest.raises(ValueError, match="groups.json: expected a JSON array"):
+        curate_prepared(output)
+
+    assert not (output / "curation-generation.json").exists()
+
+
+@pytest.mark.parametrize("failing_write", [2, 3, 4, 5])
+def test_interrupted_curation_publication_remains_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failing_write: int,
+) -> None:
+    output = tmp_path / "output"
+    _write_prepared_curation_run(output)
+    original_write = curation.atomic_write_text
+    calls = 0
+
+    def fail_during_publication(path: Path, contents: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == failing_write:
+            raise OSError("simulated curation publication failure")
+        original_write(path, contents)
+
+    monkeypatch.setattr(curation, "atomic_write_text", fail_during_publication)
+
+    with pytest.raises(OSError, match="simulated curation publication failure"):
+        curate_prepared(output)
+
+    marker = json.loads(
+        (output / "curation-generation.json").read_text(encoding="utf-8")
+    )
+    assert marker["status"] == "publishing"

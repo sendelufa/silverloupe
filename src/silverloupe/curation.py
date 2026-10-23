@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from silverloupe.contracts import (
     Assessment,
+    Asset,
     Brief,
     Decision,
     DecisionAuthority,
@@ -23,6 +25,8 @@ from silverloupe.contracts import (
     SelectionItem,
     SelectionTier,
 )
+from silverloupe.previews import validate_output_layout
+from silverloupe.state import atomic_write_text, load_run_config
 
 
 _COMPETITIVE_GROUP_TYPES = {"burst", "near_duplicate"}
@@ -48,6 +52,7 @@ _GENERIC_WEIGHTS = {
     "significant_region_exposure": 0.5,
     "accidental_subject_occlusion": 0.5,
 }
+ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
 class _GenreProfile(BaseModel):
@@ -653,3 +658,142 @@ def curate(
         protected_sets=sorted(selected_group_ids),
     )
     return decisions, selection
+
+
+def _read_json_array(path: Path, model: type[ModelT]) -> list[ModelT]:
+    if not path.is_file():
+        raise FileNotFoundError(f"required artifact does not exist: {path}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError(f"invalid {path.name}: {error}") from error
+    if not isinstance(value, list):
+        raise ValueError(f"invalid {path.name}: expected a JSON array")
+    try:
+        return [model.model_validate(item) for item in value]
+    except ValidationError as error:
+        raise ValueError(f"invalid {path.name}: {error}") from error
+
+
+def _read_jsonl(path: Path, model: type[ModelT]) -> list[ModelT]:
+    if not path.is_file():
+        raise FileNotFoundError(f"required artifact does not exist: {path}")
+    result: list[ModelT] = []
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not line.strip():
+            continue
+        try:
+            result.append(model.model_validate_json(line))
+        except ValidationError as error:
+            raise ValueError(
+                f"invalid {path.name} line {line_number}: {error}"
+            ) from error
+    return result
+
+
+def _read_manifest(output: Path) -> Manifest:
+    return Manifest(assets=_read_jsonl(output / "assets.jsonl", Asset))
+
+
+def _require_complete_assessment_generation(output: Path) -> None:
+    path = output / "assessment-generation.json"
+    if not path.is_file():
+        raise ValueError("assessment generation marker is missing; run assess again")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError(f"invalid assessment-generation.json: {error}") from error
+    if not isinstance(value, dict) or value.get("status") not in {
+        "publishing",
+        "complete",
+    }:
+        raise ValueError("invalid assessment-generation.json: unknown status")
+    if value["status"] != "complete":
+        raise ValueError("assessment generation is incomplete; run assess again")
+
+
+def _jsonl(values: list[BaseModel]) -> str:
+    return "".join(value.model_dump_json() + "\n" for value in values)
+
+
+def _publish_curation_artifacts(
+    output: Path,
+    decisions: list[Decision],
+    selection: Selection,
+    report: dict[str, Any],
+) -> None:
+    artifacts = {
+        output / "decisions.jsonl": _jsonl(decisions),
+        output / "selection.json": selection.model_dump_json(indent=2) + "\n",
+        output / "curation-report.json": json.dumps(
+            report, ensure_ascii=False, indent=2, sort_keys=True
+        )
+        + "\n",
+    }
+    generation_id = hashlib.sha256(
+        "".join(
+            f"{path.name}\0{contents}" for path, contents in artifacts.items()
+        ).encode("utf-8")
+    ).hexdigest()
+    marker_path = output / "curation-generation.json"
+    marker = {
+        "schema_version": 1,
+        "generation_id": generation_id,
+        "status": "publishing",
+        "files": [path.name for path in artifacts],
+    }
+    atomic_write_text(
+        marker_path,
+        json.dumps(marker, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+    for path, contents in artifacts.items():
+        atomic_write_text(path, contents)
+    marker["status"] = "complete"
+    atomic_write_text(
+        marker_path,
+        json.dumps(marker, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+
+
+def curate_prepared(output: Path) -> dict[str, Any]:
+    """Curate a prepared session and publish one auditable generation."""
+
+    output = output.expanduser().resolve()
+    validate_output_layout(output)
+    config = load_run_config(output)
+    _require_complete_assessment_generation(output)
+    manifest = _read_manifest(output)
+    groups = _read_json_array(output / "groups.json", Group)
+    items = _read_json_array(output / "selection-items.json", SelectionItem)
+    assessments = _read_jsonl(output / "assessments.jsonl", Assessment)
+    prior_decisions = _read_jsonl(output / "decisions.jsonl", Decision)
+    decisions, selection = curate(
+        manifest,
+        groups,
+        items,
+        assessments,
+        config.brief,
+        prior_decisions,
+    )
+    profiles = _load_profiles(config.brief)
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "completed",
+        "items": len(items),
+        "selects": len(selection.selects_ids),
+        "top": len(selection.top_ids),
+        "unmet_constraints": list(selection.unmet_constraints),
+        "profile_versions": {
+            profile.genre: profile.profile_version for profile in profiles
+        },
+        "photo_eval_status": "unavailable",
+        "photo_metrics": {
+            "burst_choice": "unavailable",
+            "ndcg": "unavailable",
+            "coverage": "unavailable",
+        },
+    }
+    _publish_curation_artifacts(output, decisions, selection, report)
+    return report

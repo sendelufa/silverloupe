@@ -15,6 +15,7 @@ from typing import Any, Sequence
 
 from silverloupe import __version__
 from silverloupe.contracts import SCHEMA_VERSION, Brief, RunConfig
+from silverloupe.curation import curate_prepared
 from silverloupe.grouping import group_prepared
 from silverloupe.inventory import prepare, resume
 from silverloupe.state import read_status
@@ -98,6 +99,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     vision_import_parser.add_argument("output")
     vision_import_parser.add_argument("response")
+    curate_parser = subparsers.add_parser(
+        "curate", help="build genre-aware selects and an ordered top"
+    )
+    curate_parser.add_argument("output")
     return parser
 
 
@@ -225,6 +230,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
             return 0 if result.status == "completed" else 3
+        if args.command == "curate":
+            output = Path(args.output).expanduser().resolve()
+            report = curate_prepared(output)
+            print(
+                json.dumps(
+                    {
+                        "status": report["status"],
+                        "items": report["items"],
+                        "selects": report["selects"],
+                        "top": report["top"],
+                        "unmet_constraints": report["unmet_constraints"],
+                        "output": str(output),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0
     except (FileNotFoundError, ValueError) as error:
         print(str(error), file=sys.stderr)
         return 2
