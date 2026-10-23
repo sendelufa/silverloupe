@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PIL import Image, ImageFilter
 
 from silverloupe.cli import main
@@ -18,6 +19,7 @@ from silverloupe.contracts import (
     SelectionItem,
 )
 from silverloupe.state import write_session
+from silverloupe import triage
 from silverloupe.triage import assess, propose_triage
 
 
@@ -193,3 +195,39 @@ def test_cli_assess_writes_auditable_partial_artifacts_from_another_cwd(
     assert (output / "decisions.jsonl").is_file()
     report = json.loads((output / "assessment-report.json").read_text(encoding="utf-8"))
     assert report["vision"] == "unavailable"
+
+
+@pytest.mark.parametrize("failing_write", [2, 3, 4, 5])
+def test_interrupted_assessment_publication_is_marked_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_write: int
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    preview = _save_preview(output, "publish", Image.new("L", (800, 600), 128))
+    asset = _asset("publish", preview=preview)
+    write_session(output, _config(output), "publish-session")
+    (output / "assets.jsonl").write_text(asset.model_dump_json() + "\n", encoding="utf-8")
+    (output / "groups.json").write_text("[]\n", encoding="utf-8")
+    (output / "selection-items.json").write_text(
+        json.dumps([_item("publish").model_dump(mode="json")]) + "\n", encoding="utf-8"
+    )
+    triage.assess_prepared(output)
+    original_write = triage.atomic_write_text
+    calls = 0
+
+    def fail_during_publication(path: Path, contents: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == failing_write:
+            raise OSError("simulated disk failure")
+        original_write(path, contents)
+
+    monkeypatch.setattr(triage, "atomic_write_text", fail_during_publication)
+
+    with pytest.raises(OSError, match="simulated disk failure"):
+        triage.assess_prepared(output)
+
+    marker = json.loads((output / "assessment-generation.json").read_text(encoding="utf-8"))
+    assert marker["status"] == "publishing"
+    with pytest.raises(ValueError, match="assessment generation is incomplete"):
+        triage.create_vision_request_prepared(output)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,6 +37,39 @@ def _preview_path(asset: Asset, config: RunConfig) -> Path | None:
     if candidate.is_symlink() or not candidate.resolve().is_relative_to(output):
         return None
     return candidate if candidate.is_file() else None
+
+
+def _file_sha256(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def asset_input_fingerprint(asset: Asset, brief: Brief, config: RunConfig) -> str:
+    """Bind assessment evidence to source identity, rendered bytes, policy, and brief."""
+
+    identity = {
+        "asset_id": asset.asset_id,
+        "relative_path": asset.relative_path,
+        "content_sha256": asset.content_sha256,
+        "media_type": asset.media_type,
+        "decode_status": asset.decode_status,
+        "dimensions": asset.dimensions,
+        "preview_provenance": asset.preview_provenance,
+        "preview_sha256": _file_sha256(_preview_path(asset, config)),
+        "rendering_policy": config.rendering_policy,
+        "brief": brief.model_dump(mode="json"),
+    }
+    return hashlib.sha256(
+        json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
 
 def _array_signals(image: Image.Image) -> dict[str, float]:
@@ -71,7 +106,10 @@ def _array_signals(image: Image.Image) -> dict[str, float]:
 def measure_asset_signals(asset: Asset, brief: Brief, config: RunConfig) -> SignalResult:
     """Measure reproducible preview-level signals without turning them into a verdict."""
 
-    signals: dict[str, Any] = {"decode_status": asset.decode_status}
+    signals: dict[str, Any] = {
+        "decode_status": asset.decode_status,
+        "input_fingerprint": asset_input_fingerprint(asset, brief, config),
+    }
     uncertainty: list[str] = []
     if asset.decode_status not in {"ready", "degraded"}:
         return SignalResult(

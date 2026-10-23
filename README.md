@@ -117,7 +117,7 @@ uv run --locked silverloupe assess /path/to/silverloupe-output
 uv run --locked silverloupe vision-request /path/to/silverloupe-output
 ```
 
-`vision-request.json` содержит только безопасные относительные пути превью, стабильные `artifact_id`, критерии и номер попытки. Передайте этот файл host-агенту Codex/Claude вместе с перечисленными изображениями. Ответ должен ссылаться только на фактически просмотренные `artifact_id`; минимальная форма:
+`vision-request.json` содержит только безопасные относительные пути превью, стабильные `artifact_id`, полный список критериев, номер попытки и `input_fingerprint`. Fingerprint связывает запрос с content hash оригинала, фактическими байтами превью, render policy и brief: ответ на устаревший запрос импортировать нельзя. Передайте файл host-агенту Codex/Claude вместе с перечисленными изображениями. Ответ должен ссылаться только на фактически просмотренные `artifact_id` и вернуть результат по **каждому** запрошенному критерию:
 
 ```json
 {
@@ -129,7 +129,14 @@ uv run --locked silverloupe vision-request /path/to/silverloupe-output
       "schema_version": 1,
       "asset_id": "…",
       "observed_artifact_ids": ["overview-…"],
-      "visual_criteria": {"focus": "acceptable"},
+      "visual_criteria": {
+        "focus_on_relevant_subject": "acceptable",
+        "motion_blur_and_intent": "acceptable",
+        "significant_region_exposure": "acceptable",
+        "eye_state_when_contextually_relevant": "not_applicable",
+        "accidental_subject_occlusion": "acceptable",
+        "artistic_intent_hypotheses": "acceptable"
+      },
       "region_evidence": [],
       "intent_hypotheses": [],
       "uncertainty": []
@@ -147,7 +154,9 @@ uv run --locked silverloupe vision-import \
   /path/to/vision-response.json
 ```
 
-Несуществующий observed ID, чужой asset, невалидный JSON или region evidence без просмотренного artifact отклоняются без замены прежних оценок. Для `transient_error` допускаются не более двух повторов; после исчерпания попыток результат остаётся `partial/review`.
+Допустимые значения критерия: `acceptable`, `concern`, `uncertain`, `not_applicable` и `insufficient_evidence`. Последнее значение честно оставляет asset в `partial/review` и позволяет сформировать новый запрос. Несуществующий observed ID, чужой asset, неполный набор критериев, `NaN`, изменившиеся входы или region evidence без просмотренного artifact отклоняются без замены прежних оценок. Для `transient_error` допускаются не более двух повторов; после исчерпания попыток результат остаётся `partial/review`.
+
+Повторный `assess` сохраняет валидные визуальные свидетельства и решения с `decision_authority: "user"` / `user_override: true`. Если оригинал, превью, brief или render policy изменились, устаревшее vision-свидетельство сбрасывается, а `vision-status.json` получает `invalidated`. Код `0` возвращается только тогда, когда оценены все assets; наличие неподдерживаемого RAW сохраняет общий статус `partial` и код `3`.
 
 Если output находится внутри исходной папки, он автоматически исключается из повторного scan. Output не может совпадать с source или быть его родительским каталогом. Silverloupe отклоняет симлинки на своих служебных путях до записи, чтобы генерация и очистка не могли затронуть оригиналы.
 
@@ -201,8 +210,9 @@ silverloupe-output/
 ├── assessments.jsonl
 ├── decisions.jsonl
 ├── assessment-report.json
+├── assessment-generation.json # publishing / complete для согласованного snapshot
 ├── vision-request.json     # появляется после vision-request
-├── vision-status.json      # pending / retry_required / completed / partial
+├── vision-status.json      # pending / retry_required / completed / partial / invalidated
 ├── previews/              # JPEG + provenance sidecars
 └── contact-sheets/
 ```
@@ -213,7 +223,7 @@ silverloupe-output/
 
 `grouping-report.json` показывает число кандидатов, типы групп и `review_group_ids`. Значение `real_photo_validation=unavailable` честно сохраняется, пока нет разрешённого пилотного набора; синтетические fixtures не объявляются доказательством совместимости конкретной камеры.
 
-`assessments.jsonl` хранит численные сигналы по каждому asset отдельно от visual evidence. Локальная дисперсия Лапласиана, яркость и высокочастотная энергия являются только baseline-сигналами: low/high key, grain, soft focus и motion blur остаются контекстными. `decisions.jsonl` содержит только proposal-решения `keep`, `review` или `unassessed`; `automatic_rejects` в отчёте равен нулю. Общие исключения описаны в [`resources/artistic-intent.md`](resources/artistic-intent.md).
+`assessments.jsonl` хранит численные сигналы по каждому asset отдельно от visual evidence. Локальная дисперсия Лапласиана, яркость и высокочастотная энергия являются только baseline-сигналами: low/high key, grain, soft focus и motion blur остаются контекстными. `decisions.jsonl` содержит только proposal-решения `keep`, `review` или `unassessed`; `automatic_rejects` в отчёте равен нулю. `assessment-generation.json` записывается первым как `publishing` и последним как `complete`, поэтому прерванная публикация не читается как согласованный результат. Общие исключения описаны в [`resources/artistic-intent.md`](resources/artistic-intent.md).
 
 ### Валидация полного run-контракта
 
@@ -259,7 +269,7 @@ grade = grade_artifacts(
 - Группировка использует индекс по камере/времени с ограниченным числом соседей, а не полный попарный перебор; совпадение имени без согласованных EXIF-свидетельств не создаёт RAW/JPEG-пару.
 - HDR, panorama и focus stack являются защищёнными наборами: неоднозначное пересечение переводится в `uncertain`, а не приводит к потере обязательных исходников.
 - Маленькое превью, неподдерживаемый RAW, возможный смаз, шум и крайняя экспозиция дают uncertainty/review, а не безусловный reject.
-- Визуальные утверждения принимаются только вместе с известными `observed_artifact_ids`; невалидный или неполный ответ не становится успешным результатом.
+- Визуальные утверждения принимаются только вместе с известными `observed_artifact_ids`, полным набором критериев и совпадающим fingerprint входов; невалидный, устаревший или неполный ответ не становится успешным результатом.
 - Шесть плановых pilot-съёмок явно отмечены `real-data-unavailable` в [`evals/dataset-manifest.json`](evals/dataset-manifest.json).
 - Для файловых проверок используется созданный в репозитории CC0 PPM-fixture с зафиксированным SHA-256.
 - Автоматическое удаление фотографий не входит в проект.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from collections import Counter
@@ -31,6 +32,7 @@ from silverloupe.vision.host_exchange import (
     apply_vision_response,
     build_vision_request,
     parse_vision_response,
+    validate_vision_request_inputs,
 )
 
 
@@ -185,6 +187,7 @@ def _read_json_array(path: Path, model: type[ModelT]) -> list[ModelT]:
 
 
 def _read_assessments(output: Path) -> list[Assessment]:
+    _validate_assessment_generation(output)
     path = output / "assessments.jsonl"
     if not path.is_file():
         raise FileNotFoundError(f"assessment artifact does not exist: {path}")
@@ -199,8 +202,97 @@ def _read_assessments(output: Path) -> list[Assessment]:
     return assessments
 
 
+def _read_decisions(output: Path) -> list[Decision]:
+    _validate_assessment_generation(output)
+    path = output / "decisions.jsonl"
+    if not path.is_file():
+        raise FileNotFoundError(f"decision artifact does not exist: {path}")
+    decisions: list[Decision] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            decisions.append(Decision.model_validate_json(line))
+        except ValidationError as error:
+            raise ValueError(f"invalid decisions.jsonl line {line_number}: {error}") from error
+    return decisions
+
+
 def _jsonl(values: list[BaseModel]) -> str:
     return "".join(value.model_dump_json() + "\n" for value in values)
+
+
+def _generation_status(output: Path) -> str | None:
+    marker = output / "assessment-generation.json"
+    if not marker.is_file():
+        return None
+    try:
+        value = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError(f"invalid assessment-generation.json: {error}") from error
+    if not isinstance(value, dict) or value.get("status") not in {"publishing", "complete"}:
+        raise ValueError("invalid assessment-generation.json: unknown status")
+    return str(value["status"])
+
+
+def _validate_assessment_generation(output: Path) -> None:
+    status = _generation_status(output)
+    if status != "complete":
+        detail = "is incomplete" if status == "publishing" else "marker is missing"
+        raise ValueError(f"assessment generation {detail}; run assess again")
+
+
+def _preserve_visual_evidence(
+    current: list[Assessment], previous: list[Assessment]
+) -> tuple[list[Assessment], bool]:
+    previous_by_id = {assessment.asset_id: assessment for assessment in previous}
+    preserved: list[Assessment] = []
+    invalidated = False
+    for assessment in current:
+        prior = previous_by_id.get(assessment.asset_id)
+        current_fingerprint = assessment.technical_signals.get("input_fingerprint")
+        prior_fingerprint = (
+            prior.technical_signals.get("input_fingerprint") if prior is not None else None
+        )
+        if (
+            prior is not None
+            and assessment.evaluation_status == "assessed"
+            and prior.visual_status in {"evaluated", "insufficient_evidence"}
+            and isinstance(current_fingerprint, str)
+            and current_fingerprint == prior_fingerprint
+        ):
+            preserved.append(
+                assessment.model_copy(
+                    update={
+                        "visual_status": prior.visual_status,
+                        "visual_criteria": dict(prior.visual_criteria),
+                        "observed_artifacts": list(prior.observed_artifacts),
+                        "region_evidence": list(prior.region_evidence),
+                        "intent_hypotheses": list(prior.intent_hypotheses),
+                        "uncertainty": sorted(
+                            set([*assessment.uncertainty, *prior.uncertainty])
+                        ),
+                    }
+                )
+            )
+        else:
+            preserved.append(assessment)
+            invalidated = invalidated or bool(
+                prior is not None
+                and prior.visual_status in {"evaluated", "insufficient_evidence"}
+            )
+    return preserved, invalidated
+
+
+def _preserve_user_decisions(
+    proposals: list[Decision], previous: list[Decision]
+) -> list[Decision]:
+    user_by_id = {
+        decision.item_id: decision
+        for decision in previous
+        if decision.decision_authority == DecisionAuthority.USER or decision.user_override
+    }
+    return [user_by_id.get(proposal.item_id, proposal) for proposal in proposals]
 
 
 def _vision_capability(config: RunConfig) -> str:
@@ -253,8 +345,29 @@ def _publish_assessment_artifacts(
         )
         + "\n",
     }
+    generation_id = hashlib.sha256(
+        "".join(f"{path.name}\0{contents}" for path, contents in artifacts.items()).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    marker_path = output / "assessment-generation.json"
+    marker = {
+        "schema_version": 1,
+        "generation_id": generation_id,
+        "status": "publishing",
+        "files": [path.name for path in artifacts],
+    }
+    atomic_write_text(
+        marker_path,
+        json.dumps(marker, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
     for path, contents in artifacts.items():
         atomic_write_text(path, contents)
+    marker["status"] = "complete"
+    atomic_write_text(
+        marker_path,
+        json.dumps(marker, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
 
 
 def assess_prepared(output: Path) -> dict[str, Any]:
@@ -265,9 +378,29 @@ def assess_prepared(output: Path) -> dict[str, Any]:
     groups = _read_json_array(output / "groups.json", Group)
     items = _read_json_array(output / "selection-items.json", SelectionItem)
     assessments = assess(manifest, groups, config.brief, config)
+    previous_assessments: list[Assessment] = []
+    previous_decisions: list[Decision] = []
+    if _generation_status(output) == "complete":
+        previous_assessments = _read_assessments(output)
+        previous_decisions = _read_decisions(output)
+    assessments, invalidated = _preserve_visual_evidence(
+        assessments, previous_assessments
+    )
     decisions = propose_triage(assessments, items, config.brief)
+    decisions = _preserve_user_decisions(decisions, previous_decisions)
     report = _assessment_report(assessments, decisions, _vision_capability(config))
     _publish_assessment_artifacts(output, assessments, decisions, report)
+    if invalidated and (output / "vision-status.json").is_file():
+        atomic_write_text(
+            output / "vision-status.json",
+            json.dumps(
+                {"schema_version": 1, "status": "invalidated", "reason": "inputs_changed"},
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+        )
     return report
 
 
@@ -308,6 +441,11 @@ def import_vision_response_prepared(output: Path, response_path: Path) -> Vision
         raise ValueError(f"invalid vision-request.json: {error}") from error
     response = parse_vision_response(response_path.read_text(encoding="utf-8"))
     assessments = _read_assessments(output)
+    config = load_run_config(output)
+    manifest = _read_manifest(output)
+    validate_vision_request_inputs(
+        request, manifest, assessments, config.brief, config
+    )
     result = apply_vision_response(request, response, assessments)
 
     if result.next_request is not None:
@@ -331,9 +469,9 @@ def import_vision_response_prepared(output: Path, response_path: Path) -> Vision
         )
         return result
 
-    config = load_run_config(output)
     items = _read_json_array(output / "selection-items.json", SelectionItem)
     decisions = propose_triage(result.assessments, items, config.brief)
+    decisions = _preserve_user_decisions(decisions, _read_decisions(output))
     report = _assessment_report(
         result.assessments,
         decisions,

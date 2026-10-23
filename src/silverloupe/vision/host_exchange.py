@@ -10,6 +10,7 @@ from PIL import Image, UnidentifiedImageError
 from pydantic import ValidationError
 
 from silverloupe.contracts import Assessment, Brief, Manifest, RunConfig
+from silverloupe.signals import asset_input_fingerprint
 from silverloupe.vision.base import (
     VisionArtifact,
     VisionImportResult,
@@ -60,6 +61,50 @@ def _artifact_id(asset_id: str, relative_path: str, digest: str) -> str:
     return f"overview-{hashlib.sha256(payload).hexdigest()[:20]}"
 
 
+def _request_input_fingerprint(
+    manifest: Manifest,
+    asset_ids: list[str],
+    brief: Brief,
+    config: RunConfig,
+) -> str:
+    assets_by_id = {asset.asset_id: asset for asset in manifest.assets}
+    unknown = set(asset_ids) - set(assets_by_id)
+    if unknown:
+        raise ValueError(f"vision request references unknown assets: {sorted(unknown)}")
+    identity = [
+        {
+            "asset_id": asset_id,
+            "input_fingerprint": asset_input_fingerprint(
+                assets_by_id[asset_id], brief, config
+            ),
+        }
+        for asset_id in sorted(asset_ids)
+    ]
+    return hashlib.sha256(
+        json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _request_identity(
+    artifacts: list[VisionArtifact],
+    assets: list[VisionRequestAsset],
+    brief: Brief,
+    input_fingerprint: str,
+) -> dict[str, object]:
+    return {
+        "artifacts": [artifact.model_dump(mode="json") for artifact in artifacts],
+        "assets": [asset.model_dump(mode="json") for asset in assets],
+        "brief": brief.model_dump(mode="json"),
+        "input_fingerprint": input_fingerprint,
+    }
+
+
+def _request_id(identity: dict[str, object]) -> str:
+    return "vision-" + hashlib.sha256(
+        json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:20]
+
+
 def build_vision_request(
     manifest: Manifest,
     assessments: list[Assessment],
@@ -85,6 +130,7 @@ def build_vision_request(
     output = Path(config.output_root).expanduser().resolve()
     artifacts: list[VisionArtifact] = []
     request_assets: list[VisionRequestAsset] = []
+    requested_asset_ids: list[str] = []
     for assessment in sorted(assessments, key=lambda value: value.asset_id):
         if assessment.evaluation_status != "assessed" or assessment.visual_status == "evaluated":
             continue
@@ -102,7 +148,11 @@ def build_vision_request(
         except (Image.DecompressionBombError, OSError, UnidentifiedImageError):
             continue
         artifact = VisionArtifact(
-            artifact_id=_artifact_id(asset.asset_id, relative_path, asset.content_sha256),
+            artifact_id=_artifact_id(
+                asset.asset_id,
+                relative_path,
+                asset_input_fingerprint(asset, brief, config),
+            ),
             asset_id=asset.asset_id,
             kind="overview",
             path=relative_path,
@@ -117,20 +167,18 @@ def build_vision_request(
                 criteria=list(_CRITERIA),
             )
         )
+        requested_asset_ids.append(asset.asset_id)
 
     if not artifacts:
         raise ValueError("no safe preview artifacts are available for host vision")
 
-    identity = {
-        "artifacts": [artifact.model_dump(mode="json") for artifact in artifacts],
-        "assets": [asset.model_dump(mode="json") for asset in request_assets],
-        "brief": brief.model_dump(mode="json"),
-    }
-    request_id = "vision-" + hashlib.sha256(
-        json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    ).hexdigest()[:20]
+    input_fingerprint = _request_input_fingerprint(
+        manifest, requested_asset_ids, brief, config
+    )
+    identity = _request_identity(artifacts, request_assets, brief, input_fingerprint)
     return VisionRequest(
-        request_id=request_id,
+        request_id=_request_id(identity),
+        input_fingerprint=input_fingerprint,
         attempt=attempt,
         max_retries=policy["max_retries"],
         artifacts=artifacts,
@@ -144,11 +192,42 @@ def build_vision_request(
     )
 
 
+def validate_vision_request_inputs(
+    request: VisionRequest,
+    manifest: Manifest,
+    assessments: list[Assessment],
+    brief: Brief,
+    config: RunConfig,
+) -> None:
+    """Reject a response when the prepared inputs changed after request creation."""
+
+    assessment_ids = {assessment.asset_id for assessment in assessments}
+    requested_asset_ids = [asset.asset_id for asset in request.assets]
+    missing = set(requested_asset_ids) - assessment_ids
+    if missing:
+        raise ValueError(f"vision request assets lack assessments: {sorted(missing)}")
+    current = _request_input_fingerprint(
+        manifest, requested_asset_ids, brief, config
+    )
+    identity = _request_identity(
+        request.artifacts, request.assets, brief, request.input_fingerprint
+    )
+    if current != request.input_fingerprint or _request_id(identity) != request.request_id:
+        raise ValueError("vision request inputs changed; create a new request")
+
+
+def _reject_nonfinite_json_number(value: str) -> None:
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
 def parse_vision_response(text: str) -> VisionResponse:
     """Parse strict response JSON while preserving a clear invalid-input boundary."""
 
     try:
-        value = json.loads(text)
+        value = json.loads(
+            text,
+            parse_constant=_reject_nonfinite_json_number,
+        )
     except (TypeError, ValueError) as error:
         raise ValueError(f"invalid vision response JSON: {error}") from error
     try:
@@ -227,21 +306,32 @@ def apply_vision_response(
             raise ValueError(
                 f"region evidence must reference an observed artifact: {sorted(invalid_regions)}"
             )
+        expected_criteria = set(requested_assets[asset_id].criteria)
+        observed_criteria = set(observation.visual_criteria)
+        if observed_criteria != expected_criteria:
+            raise ValueError(
+                f"vision criteria do not match request for {asset_id!r}: "
+                f"expected {sorted(expected_criteria)}, got {sorted(observed_criteria)}"
+            )
         current = assessments_by_id[asset_id]
         if current.evaluation_status != "assessed":
             raise ValueError(f"unassessed asset {asset_id!r} cannot receive proven visual evidence")
+        insufficient = "insufficient_evidence" in observation.visual_criteria.values()
+        uncertainty = [*current.uncertainty, *observation.uncertainty]
+        if insufficient:
+            uncertainty.append("vision_insufficient_evidence")
         updated[asset_id] = current.model_copy(
             update={
-                "visual_status": "evaluated",
+                "visual_status": (
+                    "insufficient_evidence" if insufficient else "evaluated"
+                ),
                 "visual_criteria": dict(observation.visual_criteria),
                 "observed_artifacts": list(observation.observed_artifact_ids),
                 "region_evidence": [
                     evidence.model_dump(mode="json") for evidence in observation.region_evidence
                 ],
                 "intent_hypotheses": list(observation.intent_hypotheses),
-                "uncertainty": sorted(
-                    set([*current.uncertainty, *observation.uncertainty])
-                ),
+                "uncertainty": sorted(set(uncertainty)),
             }
         )
     for asset_id in missing:
@@ -249,8 +339,20 @@ def apply_vision_response(
             assessments_by_id[asset_id], "vision_response_missing"
         )
 
-    status = "completed" if response.status == "completed" and not missing else "partial"
+    merged = [updated[assessment.asset_id] for assessment in assessments]
+    status = (
+        "completed"
+        if response.status == "completed"
+        and not missing
+        and merged
+        and all(
+            assessment.evaluation_status == "assessed"
+            and assessment.visual_status == "evaluated"
+            for assessment in merged
+        )
+        else "partial"
+    )
     return VisionImportResult(
         status=status,
-        assessments=[updated[assessment.asset_id] for assessment in assessments],
+        assessments=merged,
     )

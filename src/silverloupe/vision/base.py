@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Literal
 
 from pydantic import Field, model_validator
@@ -26,6 +27,7 @@ class VisionRequestAsset(ContractModel):
 
 class VisionRequest(ContractModel):
     request_id: str = Field(min_length=1)
+    input_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     attempt: int = Field(ge=1)
     max_retries: int = Field(ge=0, le=2)
     artifacts: list[VisionArtifact] = Field(min_length=1)
@@ -64,6 +66,8 @@ class RegionEvidence(ContractModel):
     @model_validator(mode="after")
     def region_is_normalized(self) -> RegionEvidence:
         x, y, width, height = self.region
+        if not all(math.isfinite(value) for value in self.region):
+            raise ValueError("region coordinates must be finite")
         if min(x, y, width, height) < 0 or max(x, y, width, height) > 1:
             raise ValueError("region coordinates must be normalized to 0..1")
         if width <= 0 or height <= 0 or x + width > 1 or y + height > 1:
@@ -74,7 +78,16 @@ class RegionEvidence(ContractModel):
 class VisionObservation(ContractModel):
     asset_id: str = Field(min_length=1)
     observed_artifact_ids: list[str] = Field(min_length=1)
-    visual_criteria: dict[str, str] = Field(default_factory=dict)
+    visual_criteria: dict[
+        str,
+        Literal[
+            "acceptable",
+            "concern",
+            "uncertain",
+            "not_applicable",
+            "insufficient_evidence",
+        ],
+    ] = Field(min_length=1)
     region_evidence: list[RegionEvidence] = Field(default_factory=list)
     intent_hypotheses: list[str] = Field(default_factory=list)
     uncertainty: list[str] = Field(default_factory=list)
