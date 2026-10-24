@@ -1,5 +1,7 @@
 # Silverloupe
 
+Инструкция по production-архиву и безопасной установке: [docs/user-installation.md](docs/user-installation.md).
+
 > Every frame deserves a closer look.
 
 Silverloupe — проект проверяемого ассистированного отбора фотографий для Codex и Claude Code. Цель — помочь фотографу разобрать съёмку, сохранить значимые кадры и защищённые комплекты, сформировать рабочий отбор и топ, а затем безопасно перенести подтверждённую разметку в Lightroom, Photoshop / Camera Raw или LightCraft.

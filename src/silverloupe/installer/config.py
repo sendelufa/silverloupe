@@ -2,24 +2,15 @@
 
 from __future__ import annotations
 
-from silverloupe.contracts import InstallConfig
+from silverloupe.contracts import INSTALL_EDITOR_MODES, InstallConfig
 
 
 _EDITOR_ALIASES = {"lightroom": "lightroom-classic"}
-_EDITOR_MODES = {
-    "lightroom-classic": {"native", "file", "report-only"},
-    "lightroom-cloud": {"native", "report-only"},
-    "photoshop-camera-raw": {"native", "file", "report-only"},
-    "lightcraft": {"native", "report-only"},
-    "report-only": {"report-only"},
-}
-
-
 def configure_editor(config: InstallConfig, editor: str, mode: str) -> InstallConfig:
     """Enable and select an editor without mutating the prior configuration."""
 
     normalized = _EDITOR_ALIASES.get(editor, editor)
-    allowed = _EDITOR_MODES.get(normalized)
+    allowed = INSTALL_EDITOR_MODES.get(normalized)
     if allowed is None:
         raise ValueError(f"unknown editor: {editor}")
     if mode not in allowed:

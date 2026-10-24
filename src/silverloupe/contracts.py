@@ -10,6 +10,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 SCHEMA_VERSION = 1
+INSTALL_EDITOR_MODES = {
+    "lightroom-classic": {"native", "file", "report-only"},
+    "lightroom-cloud": {"native", "report-only"},
+    "photoshop-camera-raw": {"native", "file", "report-only"},
+    "lightcraft": {"native", "report-only"},
+    "report-only": {"report-only"},
+}
 
 
 def _duplicates(values: list[str]) -> set[str]:
@@ -350,6 +357,9 @@ class InstallConfig(ContractModel):
         enabled = set(self.enabled_editors)
         if set(self.integration_mode_by_editor) != enabled:
             raise ValueError("integration modes must be declared for every enabled editor")
+        for editor, mode in self.integration_mode_by_editor.items():
+            if mode not in INSTALL_EDITOR_MODES.get(editor, set()):
+                raise ValueError(f"integration mode {mode!r} is not valid for {editor}")
         unknown_mappings = set(self.metadata_mapping_by_editor) - enabled
         if unknown_mappings:
             raise ValueError(

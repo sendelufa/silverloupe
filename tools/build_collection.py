@@ -9,6 +9,7 @@ import json
 import posixpath
 import re
 import shutil
+import subprocess
 import tarfile
 import tempfile
 from pathlib import Path
@@ -40,6 +41,7 @@ _DEV_REFERENCES = {
 }
 
 _VERSION_PATTERN = re.compile(r"^[0-9]+(?:\.[0-9A-Za-z-]+)*$")
+_REQUIREMENTS_CACHE: dict[tuple[str, str, bool], bytes] = {}
 
 
 def _safe_source(path: Path, root: Path) -> Path:
@@ -223,6 +225,37 @@ def _production_pyproject(source: Path) -> bytes:
     return text.encode("utf-8")
 
 
+def _production_requirements(source_root: Path, *, raw: bool) -> bytes:
+    lock = _safe_source(source_root / "uv.lock", source_root)
+    cache_key = (str(source_root), hashlib.sha256(lock.read_bytes()).hexdigest(), raw)
+    cached = _REQUIREMENTS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    command = [
+        "uv",
+        "export",
+        "--locked",
+        "--no-dev",
+        "--no-emit-project",
+        "--format",
+        "requirements.txt",
+    ]
+    if raw:
+        command.extend(["--extra", "raw"])
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=source_root,
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError("uv could not export the production dependency lock") from error
+    result = completed.stdout
+    _REQUIREMENTS_CACHE[cache_key] = result
+    return result
+
+
 def _tree_files(source_root: Path, relative_root: str, target_root: str) -> dict[str, bytes]:
     source = source_root / relative_root
     if source.is_symlink() or not source.is_dir():
@@ -259,7 +292,12 @@ def _release_payload(source_root: Path) -> tuple[dict[str, bytes], dict[str, Any
     payload["USER_GUIDE.md"] = _safe_source(
         source_root / "docs/user-installation.md", source_root
     ).read_bytes()
-    payload["runtime/uv.lock"] = _safe_source(source_root / "uv.lock", source_root).read_bytes()
+    payload["runtime/requirements.lock"] = _production_requirements(
+        source_root, raw=False
+    )
+    payload["runtime/requirements-raw.lock"] = _production_requirements(
+        source_root, raw=True
+    )
     payload["runtime/pyproject.toml"] = _production_pyproject(
         _safe_source(source_root / "pyproject.toml", source_root)
     )

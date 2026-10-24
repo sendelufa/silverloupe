@@ -27,7 +27,7 @@
     "report-only"
   ],
   "python": ">=3.12,<3.13",
-  "bootstrap": "uv python install 3.12 && uv run --python 3.12 install.py",
+  "bootstrap": "uv python install 3.12 && uv run --python 3.12 --no-project --with-requirements runtime/requirements.lock python install.py",
   "forbidden_paths": [
     ".pytest_cache",
     "__pycache__",

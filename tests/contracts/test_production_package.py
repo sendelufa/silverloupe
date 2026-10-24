@@ -55,6 +55,13 @@ def test_release_contains_closed_runtime_without_development_materials(tmp_path:
     assert "pytest" not in pyproject
     assert "jsonschema" not in pyproject
     assert "dependency-groups" not in pyproject
+    assert not (release / "runtime/uv.lock").exists()
+    production_lock = (release / "runtime/requirements.lock").read_text(encoding="utf-8")
+    raw_lock = (release / "runtime/requirements-raw.lock").read_text(encoding="utf-8")
+    assert "pytest" not in production_lock
+    assert "jsonschema" not in production_lock
+    assert "rawpy" not in production_lock
+    assert "rawpy" in raw_lock
 
 
 def test_release_markdown_references_are_artifact_local(tmp_path: Path) -> None:
@@ -98,6 +105,7 @@ def test_release_checksums_cover_payload_and_match_bytes(tmp_path: Path) -> None
         "pillow>=11,<13",
         "pydantic>=2.12,<3",
     ]
+    assert "--with-requirements runtime/requirements.lock" in manifest["bootstrap"]
     assert set(manifest["ownership"]) == expected_payload | {"checksums.json", "manifest.json"}
 
 
