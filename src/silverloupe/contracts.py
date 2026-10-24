@@ -306,11 +306,59 @@ class DeliveryReceipt(ContractModel):
 
 
 class InstallConfig(ContractModel):
-    host: Literal["codex", "claude-code"]
-    editor: Literal["lightroom", "photoshop-camera-raw", "lightcraft", "report-only"]
-    metadata_backend: str | None = None
+    config_version: Literal[1] = 1
+    hosts: list[Literal["codex", "claude-code"]] = Field(min_length=1)
+    scope: Literal["user", "project"] = "user"
+    install_root: str = Field(min_length=1)
+    enabled_editors: list[
+        Literal[
+            "lightroom-classic",
+            "lightroom-cloud",
+            "photoshop-camera-raw",
+            "lightcraft",
+            "report-only",
+        ]
+    ] = Field(min_length=1)
+    default_editor: Literal[
+        "lightroom-classic",
+        "lightroom-cloud",
+        "photoshop-camera-raw",
+        "lightcraft",
+        "report-only",
+    ]
+    integration_mode_by_editor: dict[
+        str, Literal["native", "file", "report-only"]
+    ]
+    metadata_mapping_by_editor: dict[str, dict[str, str]] = Field(default_factory=dict)
+    runtime_version: str = Field(min_length=1)
+    model_mode: Literal[
+        "host-vision", "local-signals", "api", "local-vision"
+    ] = "host-vision"
+    model_profile: dict[str, Any] = Field(default_factory=dict)
+    cache_quota: int = Field(default=5 * 1024**3, ge=1)
+    worker_limit: int = Field(default=1, ge=1)
     install_raw_extra: bool = False
-    runtime_mode: RuntimeMode = RuntimeMode.HOST_VISION
+
+    @model_validator(mode="after")
+    def install_choices_are_consistent(self) -> InstallConfig:
+        if len(set(self.hosts)) != len(self.hosts):
+            raise ValueError("hosts must be unique")
+        if len(set(self.enabled_editors)) != len(self.enabled_editors):
+            raise ValueError("enabled_editors must be unique")
+        if self.default_editor not in self.enabled_editors:
+            raise ValueError("default_editor must be enabled")
+        enabled = set(self.enabled_editors)
+        if set(self.integration_mode_by_editor) != enabled:
+            raise ValueError("integration modes must be declared for every enabled editor")
+        unknown_mappings = set(self.metadata_mapping_by_editor) - enabled
+        if unknown_mappings:
+            raise ValueError(
+                f"metadata mappings refer to disabled editors: {sorted(unknown_mappings)}"
+            )
+        root = Path(self.install_root).expanduser()
+        if not root.is_absolute() or ".." in root.parts:
+            raise ValueError("install_root must be an absolute path")
+        return self
 
 
 class SessionConfig(ContractModel):
