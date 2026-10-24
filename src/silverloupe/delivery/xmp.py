@@ -74,14 +74,14 @@ def _parse(data: bytes | None) -> ET.Element:
         raise ValueError(f"invalid XMP packet: {error}") from error
 
 
-def _description(root: ET.Element) -> ET.Element:
-    description = root.find(f".//{{{NS_RDF}}}Description")
-    if description is not None:
-        return description
-    rdf = root.find(f".//{{{NS_RDF}}}RDF")
+def _descriptions(root: ET.Element) -> list[ET.Element]:
+    rdf = root if root.tag == f"{{{NS_RDF}}}RDF" else root.find(f".//{{{NS_RDF}}}RDF")
     if rdf is None:
         rdf = ET.SubElement(root, f"{{{NS_RDF}}}RDF")
-    return ET.SubElement(rdf, f"{{{NS_RDF}}}Description")
+    descriptions = list(rdf.findall(f"{{{NS_RDF}}}Description"))
+    if not descriptions:
+        descriptions.append(ET.SubElement(rdf, f"{{{NS_RDF}}}Description"))
+    return descriptions
 
 
 def _scalar(description: ET.Element, namespace: str, name: str) -> str | None:
@@ -95,14 +95,26 @@ def _scalar(description: ET.Element, namespace: str, name: str) -> str | None:
 
 
 def _set_scalar(
-    description: ET.Element,
+    root: ET.Element,
     namespace: str,
     name: str,
     value: Any,
 ) -> None:
     key = f"{{{namespace}}}{name}"
-    for element in list(description.findall(key)):
-        description.remove(element)
+    descriptions = _descriptions(root)
+    description = next(
+        (
+            candidate
+            for candidate in descriptions
+            if key in candidate.attrib or candidate.find(key) is not None
+        ),
+        descriptions[0],
+    )
+    for candidate in descriptions:
+        for element in list(candidate.findall(key)):
+            candidate.remove(element)
+        if candidate is not description:
+            candidate.attrib.pop(key, None)
     if value is None:
         description.attrib.pop(key, None)
     else:
@@ -123,33 +135,59 @@ def _keywords(description: ET.Element) -> list[str]:
     ]
 
 
-def _set_keywords(description: ET.Element, values: list[str]) -> None:
-    subject = description.find(f"{{{NS_DC}}}subject")
-    if subject is None:
-        subject = ET.SubElement(description, f"{{{NS_DC}}}subject")
-    bag = subject.find(f"{{{NS_RDF}}}Bag")
-    if bag is None:
-        for child in list(subject):
-            subject.remove(child)
-        bag = ET.SubElement(subject, f"{{{NS_RDF}}}Bag")
-    for child in list(bag):
-        bag.remove(child)
+def _all_keywords(root: ET.Element) -> list[str]:
+    values: list[str] = []
+    for description in _descriptions(root):
+        values.extend(_keywords(description))
+    return list(dict.fromkeys(values))
+
+
+def _set_keywords(root: ET.Element, values: list[str]) -> None:
+    descriptions = _descriptions(root)
+    description = next(
+        (
+            candidate
+            for candidate in descriptions
+            if candidate.find(f"{{{NS_DC}}}subject") is not None
+        ),
+        descriptions[0],
+    )
+    for candidate in descriptions:
+        for subject in list(candidate.findall(f"{{{NS_DC}}}subject")):
+            candidate.remove(subject)
+    subject = ET.SubElement(description, f"{{{NS_DC}}}subject")
+    bag = ET.SubElement(subject, f"{{{NS_RDF}}}Bag")
     for value in values:
         element = ET.SubElement(bag, f"{{{NS_RDF}}}li")
         element.text = value
 
 
 def _values(root: ET.Element) -> dict[str, Any]:
-    description = _description(root)
-    rating_text = _scalar(description, NS_XMP, "Rating")
+    descriptions = _descriptions(root)
+    rating_text = next(
+        (
+            value
+            for description in descriptions
+            if (value := _scalar(description, NS_XMP, "Rating")) is not None
+        ),
+        None,
+    )
+    label = next(
+        (
+            value
+            for description in descriptions
+            if (value := _scalar(description, NS_XMP, "Label")) is not None
+        ),
+        None,
+    )
     try:
         rating: int | None = int(rating_text) if rating_text is not None else None
     except ValueError:
         rating = None
     return {
         "rating": rating,
-        "label": _scalar(description, NS_XMP, "Label"),
-        "keywords": _keywords(description),
+        "label": label,
+        "keywords": _all_keywords(root),
     }
 
 
@@ -169,15 +207,14 @@ def merge_xmp(
     """Merge only declared fields, preserving every other RDF property."""
 
     root = _parse(original)
-    description = _description(root)
     by_field = {change.field: change.value for change in changes}
     unknown = sorted(set(by_field) - {"rating", "label", "keywords"})
     if unknown:
         raise ValueError(f"unsupported XMP fields: {unknown}")
     if "rating" in by_field:
-        _set_scalar(description, NS_XMP, "Rating", by_field["rating"])
+        _set_scalar(root, NS_XMP, "Rating", by_field["rating"])
     if "label" in by_field:
-        _set_scalar(description, NS_XMP, "Label", by_field["label"])
+        _set_scalar(root, NS_XMP, "Label", by_field["label"])
     if "keywords" in by_field:
         keyword_ownership = ownership.get("keywords", {})
         previously_owned = set(
@@ -185,10 +222,10 @@ def merge_xmp(
             if isinstance(keyword_ownership, dict)
             else []
         )
-        preserved = [value for value in _keywords(description) if value not in previously_owned]
+        preserved = [value for value in _all_keywords(root) if value not in previously_owned]
         desired = [str(value) for value in by_field["keywords"]]
         merged = list(dict.fromkeys([*preserved, *desired]))
-        _set_keywords(description, merged)
+        _set_keywords(root, merged)
     encoded = ET.tostring(root, encoding="utf-8", xml_declaration=True)
     return encoded, _values(root)
 

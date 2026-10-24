@@ -310,6 +310,39 @@ def test_merge_xmp_preserves_unknown_and_develop_fields_and_replaces_only_owned_
     assert text.count(">4<") == 0  # canonical writer removes duplicate element form
 
 
+def test_merge_xmp_finds_owned_fields_across_multiple_descriptions(
+    tmp_path: Path,
+) -> None:
+    original = b"""<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description xmlns:custom="urn:example:custom" custom:Token="keep-me" />
+    <rdf:Description xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+      xmlns:dc="http://purl.org/dc/elements/1.1/" xmp:Rating="2">
+      <dc:subject><rdf:Bag><rdf:li>user-keyword</rdf:li></rdf:Bag></dc:subject>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"""
+    changes = [
+        ProposedChange(asset_id="a", item_id="i", field="rating", value=4),
+        ProposedChange(
+            asset_id="a", item_id="i", field="keywords", value=["silverloupe:select"]
+        ),
+    ]
+
+    encoded, values = merge_xmp(original, changes, {})
+    sidecar = tmp_path / "multiple-descriptions.xmp"
+    sidecar.write_bytes(encoded)
+
+    assert values == {
+        "rating": 4,
+        "label": None,
+        "keywords": ["user-keyword", "silverloupe:select"],
+    }
+    assert read_xmp(sidecar) == values
+    assert b"keep-me" in encoded
+
+
 def test_merge_xmp_rejects_doctype_instead_of_replacing_invalid_packet() -> None:
     packet = b'<!DOCTYPE x [<!ENTITY boom SYSTEM "file:///etc/passwd">]><x>&boom;</x>'
 

@@ -200,6 +200,76 @@ def test_partial_apply_resumes_and_repeated_apply_is_idempotent(
     assert read_xmp(_sidecar(source, second))["keywords"] == ["silverloupe:select"]
 
 
+def test_resume_recovers_postimage_when_applied_journal_append_was_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    asset = _write_raw(source, "journal-gap.cr2", b"journal-gap")
+    plan = _plan(source, output, [asset], [SelectionTier.TOP])
+    real_append = delivery_base._append_journal
+    interrupted = False
+
+    def interrupt_applied_record_once(path, record):
+        nonlocal interrupted
+        if record.get("status") == "applied" and not interrupted:
+            interrupted = True
+            raise OSError("simulated journal interruption after sidecar replacement")
+        return real_append(path, record)
+
+    monkeypatch.setattr(delivery_base, "_append_journal", interrupt_applied_record_once)
+
+    partial = apply_delivery(plan)
+    assert partial.status == "partial"
+    assert _sidecar(source, asset).is_file()
+
+    resumed = apply_delivery(plan)
+    assert resumed.status == "complete"
+    assert resumed.outcomes[0].status == "skipped"
+
+    rollback = rollback_delivery(resumed)
+
+    assert rollback.status == "rolled_back"
+    assert not _sidecar(source, asset).exists()
+
+
+def test_resume_discards_only_an_unterminated_journal_tail(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    asset = _write_raw(source, "truncated-journal.nef", b"truncated-journal")
+    plan = _plan(source, output, [asset], [SelectionTier.SELECT])
+    first = apply_delivery(plan)
+    journal = output / (plan.journal_path or "")
+    with journal.open("ab") as handle:
+        handle.write(b'{"status":"appl')
+
+    resumed = apply_delivery(plan)
+
+    assert first.status == resumed.status == "complete"
+    assert resumed.outcomes[0].status == "skipped"
+    assert journal.read_bytes().endswith(b"\n")
+
+
+def test_resume_normalizes_a_complete_journal_record_without_newline(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    asset = _write_raw(source, "missing-newline.cr2", b"missing-newline")
+    plan = _plan(source, output, [asset], [SelectionTier.TOP])
+    first = apply_delivery(plan)
+    journal = output / (plan.journal_path or "")
+    journal.write_bytes(journal.read_bytes().removesuffix(b"\n"))
+
+    resumed = apply_delivery(plan)
+
+    assert first.status == resumed.status == "complete"
+    assert resumed.outcomes[0].status == "skipped"
+    assert journal.read_bytes().endswith(b"\n")
+
+
 def test_previous_receipt_updates_owned_rating_and_removes_only_owned_keywords(
     tmp_path: Path,
 ) -> None:

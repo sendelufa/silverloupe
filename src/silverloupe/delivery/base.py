@@ -371,6 +371,11 @@ def apply_delivery(plan: DeliveryPlan) -> DeliveryReceipt:
         for record in records
         if record.get("status") == "applied" and record.get("operation_id")
     }
+    prepared_by_operation = {
+        str(record["operation_id"]): record
+        for record in records
+        if record.get("status") == "prepared" and record.get("operation_id")
+    }
     outcomes: list[DeliveryOutcome] = []
     ownership: dict[str, Any] = {}
     rollback_data: dict[str, Any] = {}
@@ -413,32 +418,53 @@ def apply_delivery(plan: DeliveryPlan) -> DeliveryReceipt:
                 )
             )
             continue
+        prepared = prepared_by_operation.get(operation_id)
+        if prepared is not None and _record_conflict(plan, mapping, prepared) is None:
+            recovered = {**prepared, "status": "applied", "recovered": True}
+            _append_journal(journal_path, recovered)
+            outcomes.append(
+                DeliveryOutcome(
+                    asset_id=mapping.asset_id,
+                    target_id=mapping.target_id,
+                    operation_id=operation_id,
+                    status="skipped",
+                    readback_values=recovered.get("readback", {}),
+                )
+            )
+            ownership[mapping.asset_id] = recovered.get("ownership", {})
+            rollback_data[mapping.asset_id] = recovered.get("rollback", {})
+            backup = recovered.get("rollback", {}).get("backup_path")
+            if backup:
+                backups.append(str(backup))
+            continue
         try:
             staged = stage_xmp(plan, mapping)
-            readback = commit_staged_xmp(staged)
-            field_ownership = _field_ownership(plan, mapping, changes, readback)
+            field_ownership = _field_ownership(plan, mapping, changes, staged.readback)
             rollback = {
                 "target_id": mapping.target_id,
                 "target_existed": staged.target_existed,
                 "preimage_sha256": staged.target_sha256,
-                "postimage_sha256": _file_sha256(staged.target_path),
+                "postimage_sha256": staged.staged_sha256,
                 "backup_path": (
                     staged.backup_path.relative_to(output).as_posix()
                     if staged.backup_path is not None
                     else None
                 ),
-                "readback": readback,
+                "readback": staged.readback,
             }
-            record = {
+            prepared_record = {
                 "schema_version": 1,
                 "operation_id": operation_id,
                 "asset_id": mapping.asset_id,
                 "target_id": mapping.target_id,
-                "status": "applied",
-                "readback": readback,
+                "status": "prepared",
+                "readback": staged.readback,
                 "ownership": field_ownership,
                 "rollback": rollback,
             }
+            _append_journal(journal_path, prepared_record)
+            readback = commit_staged_xmp(staged)
+            record = {**prepared_record, "status": "applied", "readback": readback}
             _append_journal(journal_path, record)
             outcomes.append(
                 DeliveryOutcome(
@@ -618,16 +644,33 @@ def _read_journal(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
     records: list[dict[str, Any]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
+    raw_lines = path.read_bytes().splitlines(keepends=True)
+    offset = 0
+    for line_number, raw_line in enumerate(raw_lines, start=1):
+        terminated = raw_line.endswith(b"\n")
+        encoded = raw_line.rstrip(b"\r\n")
+        if not encoded.strip():
+            offset += len(raw_line)
             continue
         try:
-            value = json.loads(line)
-        except ValueError as error:
+            value = json.loads(encoded.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as error:
+            if line_number == len(raw_lines) and not terminated:
+                with path.open("r+b") as handle:
+                    handle.truncate(offset)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                break
             raise ValueError(f"invalid delivery journal line {line_number}: {error}") from error
         if not isinstance(value, dict):
             raise ValueError(f"invalid delivery journal line {line_number}: expected object")
         records.append(value)
+        offset += len(raw_line)
+        if line_number == len(raw_lines) and not terminated:
+            with path.open("ab") as handle:
+                handle.write(b"\n")
+                handle.flush()
+                os.fsync(handle.fileno())
     return records
 
 
