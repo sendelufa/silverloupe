@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
+
+import pytest
 
 from silverloupe.contracts import (
     Asset,
@@ -8,10 +11,17 @@ from silverloupe.contracts import (
     DecisionAuthority,
     DecisionStatus,
     Manifest,
+    ProposedChange,
     SelectionItem,
     SelectionTier,
 )
 from silverloupe.delivery import plan_delivery, reject_batch_hash
+from silverloupe.delivery.xmp import (
+    commit_staged_xmp,
+    merge_xmp,
+    read_xmp,
+    stage_xmp,
+)
 
 
 def _asset(asset_id: str, relative_path: str, *, metadata: dict | None = None) -> Asset:
@@ -82,8 +92,6 @@ def test_plan_maps_tiers_to_ratings_and_capture_uses_only_primary_asset(
         items,
         decisions,
         "xmp-sidecar",
-        source_root=tmp_path / "source",
-        output_root=tmp_path / "output",
     )
 
     assert plan.status == "ready"
@@ -110,8 +118,6 @@ def test_plan_expands_composite_to_every_required_asset(tmp_path: Path) -> None:
         [item],
         [_decision("pano", tier=SelectionTier.TOP)],
         "xmp-sidecar",
-        source_root=tmp_path / "source",
-        output_root=tmp_path / "output",
     )
 
     assert {mapping.asset_id for mapping in plan.asset_mappings} == {"a", "b"}
@@ -128,8 +134,6 @@ def test_existing_user_rating_is_a_conflict_without_prior_ownership(tmp_path: Pa
         [_capture("rated", "a")],
         [_decision("rated", tier=SelectionTier.RESERVE)],
         "xmp-sidecar",
-        source_root=tmp_path / "source",
-        output_root=tmp_path / "output",
     )
 
     assert "rating" not in _changes(plan, "a")
@@ -146,16 +150,12 @@ def test_proposed_reject_needs_exact_batch_hash_before_reject_value(tmp_path: Pa
         items,
         decisions,
         "xmp-sidecar",
-        source_root=tmp_path / "source",
-        output_root=tmp_path / "output",
     )
     wrong_hash = plan_delivery(
         manifest,
         items,
         decisions,
         "xmp-sidecar",
-        source_root=tmp_path / "source",
-        output_root=tmp_path / "output",
         accepted_reject_hash="0" * 64,
     )
     accepted = plan_delivery(
@@ -163,8 +163,6 @@ def test_proposed_reject_needs_exact_batch_hash_before_reject_value(tmp_path: Pa
         items,
         decisions,
         "xmp-sidecar",
-        source_root=tmp_path / "source",
-        output_root=tmp_path / "output",
         accepted_reject_hash=reject_batch_hash(decisions),
     )
 
@@ -188,8 +186,6 @@ def test_user_authority_reject_does_not_need_batch_hash(tmp_path: Path) -> None:
             )
         ],
         "xmp-sidecar",
-        source_root=tmp_path / "source",
-        output_root=tmp_path / "output",
     )
 
     assert _changes(plan, "a")["rating"] == -1
@@ -206,8 +202,6 @@ def test_same_stem_sidecar_collision_is_reported_and_not_planned(tmp_path: Path)
             _decision("b-item", tier=SelectionTier.SELECT),
         ],
         "xmp-sidecar",
-        source_root=tmp_path / "source",
-        output_root=tmp_path / "output",
     )
 
     assert plan.status == "report_only"
@@ -232,16 +226,12 @@ def test_unverified_or_embedded_metadata_targets_remain_report_only(tmp_path: Pa
         [item],
         [decision],
         "xmp-sidecar",
-        source_root=tmp_path / "source",
-        output_root=tmp_path / "output",
     )
     native_plan = plan_delivery(
         manifest,
         [item],
         [decision],
         "lightroom-classic-native",
-        source_root=tmp_path / "source",
-        output_root=tmp_path / "output",
     )
 
     assert jpeg_plan.status == "report_only"
@@ -249,3 +239,130 @@ def test_unverified_or_embedded_metadata_targets_remain_report_only(tmp_path: Pa
     assert native_plan.status == "report_only"
     assert native_plan.backend == "native"
     assert native_plan.conflicts[0]["reason"] == "native_capability_unavailable"
+
+
+def test_merge_xmp_creates_minimal_packet_with_unicode_keywords() -> None:
+    changes = [
+        # Different item IDs are irrelevant once changes are grouped by asset.
+        # The merge contract is deliberately field-level.
+        ProposedChange(asset_id="a", item_id="i", field="rating", value=5),
+        ProposedChange(
+            asset_id="a",
+            item_id="i",
+            field="keywords",
+            value=["silverloupe:top", "Клиент:избранное"],
+        ),
+    ]
+
+    encoded, values = merge_xmp(None, changes, {})
+
+    assert values == {
+        "rating": 5,
+        "label": None,
+        "keywords": ["silverloupe:top", "Клиент:избранное"],
+    }
+    assert b"xmpmeta" in encoded
+    assert "Клиент:избранное" in encoded.decode("utf-8")
+
+
+def test_merge_xmp_preserves_unknown_and_develop_fields_and_replaces_only_owned_values(
+    tmp_path: Path,
+) -> None:
+    original = b"""<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+      xmlns:dc="http://purl.org/dc/elements/1.1/"
+      xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+      xmlns:custom="urn:example:custom"
+      xmp:Rating="2" crs:Exposure2012="+0.25" custom:Token="keep-me">
+      <xmp:Rating>2</xmp:Rating>
+      <dc:subject><rdf:Bag>
+        <rdf:li>user-keyword</rdf:li>
+        <rdf:li>silverloupe:top</rdf:li>
+      </rdf:Bag></dc:subject>
+      <custom:Nested><rdf:Description custom:Value="still-here" /></custom:Nested>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"""
+    changes = [
+        ProposedChange(asset_id="a", item_id="i", field="rating", value=4),
+        ProposedChange(
+            asset_id="a", item_id="i", field="keywords", value=["silverloupe:select"]
+        ),
+    ]
+
+    encoded, values = merge_xmp(
+        original,
+        changes,
+        {"keywords": {"owned": ["silverloupe:top"]}, "rating": {"last": 5}},
+    )
+    sidecar = tmp_path / "roundtrip.xmp"
+    sidecar.write_bytes(encoded)
+
+    assert values["rating"] == 4
+    assert values["keywords"] == ["user-keyword", "silverloupe:select"]
+    assert read_xmp(sidecar) == values
+    text = encoded.decode("utf-8")
+    assert "+0.25" in text
+    assert "keep-me" in text
+    assert "still-here" in text
+    assert text.count(">4<") == 0  # canonical writer removes duplicate element form
+
+
+def test_merge_xmp_rejects_doctype_instead_of_replacing_invalid_packet() -> None:
+    packet = b'<!DOCTYPE x [<!ENTITY boom SYSTEM "file:///etc/passwd">]><x>&boom;</x>'
+
+    with pytest.raises(ValueError, match="DOCTYPE|entity"):
+        merge_xmp(
+            packet,
+            [ProposedChange(asset_id="a", item_id="i", field="rating", value=5)],
+            {},
+        )
+
+
+def test_stage_hashes_preimages_backs_up_and_commits_only_adjacent_sidecar(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    output_root = tmp_path / "output"
+    source_root.mkdir()
+    source = source_root / "nested" / "frame.cr2"
+    source.parent.mkdir()
+    source.write_bytes(b"raw-fixture")
+    sidecar = source.with_suffix(".xmp")
+    original = merge_xmp(
+        None,
+        [
+            ProposedChange(asset_id="a", item_id="i", field="keywords", value=["user-keyword"])
+        ],
+        {},
+    )[0]
+    sidecar.write_bytes(original)
+    asset = Asset(
+        asset_id="a",
+        relative_path="nested/frame.cr2",
+        content_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+        media_type="image/x-raw",
+    )
+    plan = plan_delivery(
+        Manifest(assets=[asset]),
+        [_capture("frame", "a")],
+        [_decision("frame", tier=SelectionTier.TOP)],
+        "xmp-sidecar",
+        source_root=source_root,
+        output_root=output_root,
+    )
+
+    staged = stage_xmp(plan, plan.asset_mappings[0])
+
+    assert sidecar.read_bytes() == original
+    assert staged.staged_path.is_file()
+    assert staged.backup_path is not None and staged.backup_path.read_bytes() == original
+    assert staged.readback["rating"] == 5
+    assert staged.readback["keywords"] == ["user-keyword", "silverloupe:top"]
+
+    readback = commit_staged_xmp(staged)
+
+    assert readback == staged.readback
+    assert sidecar.read_bytes() == staged.staged_path.read_bytes()

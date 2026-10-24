@@ -21,6 +21,7 @@ from silverloupe.contracts import (
     SelectionTier,
 )
 from silverloupe.delivery.adobe import PROPRIETARY_RAW_EXTENSIONS, target_profile
+from silverloupe.delivery.xmp import read_xmp
 
 
 _RATING_BY_TIER = {
@@ -97,6 +98,14 @@ def _plan_id(plan_payload: dict[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(plan_payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def plan_delivery(
@@ -211,12 +220,59 @@ def plan_delivery(
     for item, decision, asset, metadata_path in candidates:
         if asset.asset_id in collided_ids:
             continue
+        existing_values = dict(asset.existing_metadata)
         expected_before: dict[str, Any] = {
             "source_sha256": asset.content_sha256,
             "metadata_exists": False,
             "metadata_sha256": None,
-            "field_values": asset.existing_metadata,
+            "field_values": existing_values,
         }
+        if source is not None:
+            source_path = source / asset.relative_path
+            metadata_file = source / metadata_path
+            if (
+                source_path.is_symlink()
+                or not source_path.is_file()
+                or not source_path.resolve().is_relative_to(source)
+                or _file_sha256(source_path) != asset.content_sha256
+            ):
+                conflicts.append(
+                    {
+                        "asset_id": asset.asset_id,
+                        "item_id": item.item_id,
+                        "reason": "source_preimage_changed",
+                    }
+                )
+                continue
+            if metadata_file.is_symlink():
+                conflicts.append(
+                    {
+                        "asset_id": asset.asset_id,
+                        "item_id": item.item_id,
+                        "reason": "unsafe_metadata_symlink",
+                    }
+                )
+                continue
+            if metadata_file.is_file():
+                try:
+                    existing_values = read_xmp(metadata_file)
+                except ValueError as error:
+                    conflicts.append(
+                        {
+                            "asset_id": asset.asset_id,
+                            "item_id": item.item_id,
+                            "reason": "invalid_xmp_preimage",
+                            "error": str(error),
+                        }
+                    )
+                    continue
+                expected_before.update(
+                    {
+                        "metadata_exists": True,
+                        "metadata_sha256": _file_sha256(metadata_file),
+                        "field_values": existing_values,
+                    }
+                )
         mappings.append(
             AssetMapping(
                 asset_id=asset.asset_id,
@@ -228,7 +284,7 @@ def plan_delivery(
         )
         changes = _desired_changes(decision, reject_authorized=reject_authorized)
         for field, value in changes.items():
-            existing = asset.existing_metadata.get(field)
+            existing = existing_values.get(field)
             if field != "keywords" and existing is not None and not _owned(
                 previous_receipt, asset.asset_id, field
             ):
