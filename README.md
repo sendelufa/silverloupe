@@ -6,7 +6,7 @@ Silverloupe — проект проверяемого ассистированн
 
 ## Текущий статус
 
-**Реализован первый полный recommendation-only workflow:** read-only подготовка, консервативная группировка, проверяемый host-vision exchange, жанровая редактура, статический отчёт и revision-bound ручные исправления. Перенос разметки в редакторы пока не реализован.
+**Реализован полный recommendation workflow и безопасное транзакционное ядро доставки:** read-only подготовка, консервативная группировка, проверяемый host-vision exchange, жанровая редактура, статический отчёт, revision-bound ручные исправления и contract-tested XMP sidecar plan/apply/rollback. Совместимость конкретных версий Adobe остаётся `not-tested`, пока нет реального application round-trip.
 
 | Возможность | Статус |
 |---|---|
@@ -25,7 +25,9 @@ Silverloupe — проект проверяемого ассистированн
 | Жанровая редактура и итоговые `selects` / `top` | Готово (качество на реальных фото ещё не подтверждено) |
 | Статический отчёт и revision-bound ручные исправления | Готово |
 | Production-набор из шести скиллов и отдельный dev-toolkit | Готово |
-| Перенос разметки в редакторы | Запланировано в Issues #7–8 |
+| XMP sidecar plan/apply/readback/rollback для proprietary RAW | Готово на contract fixtures |
+| Lightroom Classic / Photoshop / Bridge application round-trip | `not-tested`; report-only до реального probe |
+| Нативная разметка LightCraft | Запланировано в Issue #8 |
 
 Актуальные этапы и критерии готовности находятся в [плане разработки](docs/superpowers/plans/2026-10-22-silverloupe.md) и [GitHub Issues](https://github.com/sendelufa/silverloupe/issues).
 
@@ -119,7 +121,26 @@ uv run --locked silverloupe apply-overrides /path/to/output /path/to/overrides.j
 
 Исключение из `top` переводит item в selects, исключение из `selects` — в reserve. Ни одно из этих действий не создаёт технический reject. Правка привязана к revision, получает user authority и сохраняется при повторном `run`.
 
-Delivery в версии 0.1.0 остаётся **report-only** до Issues #7–8: Silverloupe не записывает звёзды, flags, XMP или develop settings в Lightroom, Camera Raw и другие редакторы.
+### Перенос метаданных
+
+Сначала создайте не изменяющий файлы план с явно выбранным backend:
+
+```bash
+uv run --locked silverloupe delivery-plan /path/to/output --target xmp-sidecar
+```
+
+Проверьте `delivery-plan.json`, особенно `conflicts`. `xmp-sidecar` — contract-tested низкоуровневый backend только для соседних sidecar проприетарных RAW. Он не означает, что установленная версия Lightroom, Photoshop, Bridge или Camera Raw уже проверена. Целевые профили Adobe остаются `not-tested` и дают report-only plan до реального round-trip.
+
+Применение и безопасный откат выполняются отдельно:
+
+```bash
+uv run --locked silverloupe delivery-apply /path/to/output
+uv run --locked silverloupe delivery-rollback /path/to/output
+```
+
+Apply сверяет хеши RAW и XMP, сохраняет неизвестные XMP/develop-поля, создаёт staging, backup, journal и `delivery-receipt.json`, затем проверяет readback. Batch не притворяется атомарным: partial можно повторить. Rollback — conflict-safe и не затирает последующую правку редактора или пользователя.
+
+Для пересмотренного отбора постройте новый план с `--previous-receipt`; только принадлежащие Silverloupe значения могут быть обновлены или сняты. Proposed reject не становится reject-значением без user/validated-policy authority либо точного `--accept-reject-hash`. JPEG, TIFF, DNG и PSD не изменяются на месте и пока идут по report/copy workflow.
 
 ### Production skills и dev-toolkit
 

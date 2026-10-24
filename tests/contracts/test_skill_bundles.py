@@ -12,6 +12,7 @@ from tools.build_collection import build_collection
 ROOT = Path(__file__).parents[2]
 ROUTING_CASES = ROOT / "evals/cases/routing.jsonl"
 B2_BASELINE = ROOT / "evals/baselines/issue-6-b2.jsonl"
+ADOBE_MATRIX = ROOT / "evals/compatibility-matrix.json"
 
 
 def _read_jsonl(path: Path) -> list[dict]:
@@ -141,6 +142,16 @@ def test_source_skills_have_closed_conditional_references_and_no_dev_leakage() -
     assert "../../resources/artistic-intent.md" in triage
 
 
+def test_deliver_skill_references_both_adobe_adapters() -> None:
+    path = ROOT / "skills/silverloupe-deliver/SKILL.md"
+    document = path.read_text(encoding="utf-8")
+
+    assert "../../resources/adapters/lightroom.md" in document
+    assert "../../resources/adapters/photoshop.md" in document
+    for link in _links(path):
+        assert (path.parent / link).resolve().is_file()
+
+
 def test_eval_skill_is_dev_only_and_does_not_trigger_for_ordinary_selection() -> None:
     path = ROOT / "dev/skills/silverloupe-eval/SKILL.md"
     document = path.read_text(encoding="utf-8")
@@ -193,6 +204,12 @@ def test_runtime_bundle_preserves_canonical_reference_bytes_and_is_deterministic
     assert (
         first / "skills/silverloupe/references/contracts.md"
     ).read_bytes() == (ROOT / "resources/contracts.md").read_bytes()
+    assert (
+        first / "skills/silverloupe-deliver/references/adapters/lightroom.md"
+    ).read_bytes() == (ROOT / "resources/adapters/lightroom.md").read_bytes()
+    assert (
+        first / "skills/silverloupe-deliver/references/adapters/photoshop.md"
+    ).read_bytes() == (ROOT / "resources/adapters/photoshop.md").read_bytes()
 
 
 def test_bundle_builder_rejects_nonempty_destination_traversal_and_symlink_sources(
@@ -269,3 +286,78 @@ def test_issue6_documentation_and_two_host_smoke_are_versioned() -> None:
     assert all(isinstance(record["observable_actions"], list) for record in records)
     assert all(isinstance(record["artifact_paths"], list) for record in records)
     assert all("private_reasoning" not in record for record in records)
+
+
+def test_adobe_compatibility_matrix_is_fail_closed_and_evidence_backed() -> None:
+    matrix = json.loads(ADOBE_MATRIX.read_text(encoding="utf-8"))
+    rows = matrix["combinations"]
+
+    assert matrix["schema_version"] == 1
+    assert matrix["environment"] == {
+        "platform": "macOS 26.6.2",
+        "architecture": "arm64",
+        "lightroom_classic": {"status": "installed", "version": "15.0.1"},
+        "photoshop": {"status": "unavailable", "version": None},
+        "bridge": {"status": "unavailable", "version": None},
+        "exiftool": {"status": "unavailable", "version": None},
+    }
+    assert {row["format"] for row in rows} == {"raw", "jpeg", "tiff", "dng", "psd"}
+    assert {row["editor"] for row in rows} == {
+        "lightroom-classic",
+        "photoshop-camera-raw",
+    }
+    assert all(row["status"] in {"verified", "failed", "not-tested"} for row in rows)
+    assert all(
+        set(row)
+        == {
+            "editor",
+            "editor_version",
+            "platform",
+            "architecture",
+            "format",
+            "route",
+            "status",
+            "fields",
+            "fixture_sha256",
+            "evidence",
+            "blockers",
+        }
+        for row in rows
+    )
+    for row in rows:
+        evidence = row["evidence"]
+        assert set(evidence) == {
+            "write",
+            "read",
+            "readback",
+            "develop_preserved",
+            "flags",
+            "custom_color_labels",
+        }
+        if row["status"] == "verified":
+            assert row["editor_version"]
+            assert row["platform"] and row["architecture"]
+            assert row["fields"]
+            assert re.fullmatch(r"[0-9a-f]{64}", row["fixture_sha256"])
+            assert all(
+                evidence[name] == "passed"
+                for name in ("write", "read", "readback", "develop_preserved")
+            )
+        else:
+            assert row["blockers"]
+
+
+def test_issue7_delivery_documentation_names_safe_commands_and_limitations() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    contracts = (ROOT / "resources/contracts.md").read_text(encoding="utf-8")
+
+    for phrase in (
+        "silverloupe delivery-plan",
+        "silverloupe delivery-apply",
+        "silverloupe delivery-rollback",
+        "xmp-sidecar",
+        "not-tested",
+    ):
+        assert phrase in readme
+    for phrase in ("delivery-plan.json", "delivery-receipt.json", "conflict-safe"):
+        assert phrase in contracts

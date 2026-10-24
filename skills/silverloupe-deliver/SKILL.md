@@ -11,7 +11,7 @@ description: >
 
 ## Overview
 
-Publish and explain the static review report. Version 0.1.0 is report-only: editor writes remain unavailable until verified metadata backends and round-trip checks are delivered by later work.
+Publish the static report and, only when the user explicitly selected a supported metadata route, build/apply/roll back its delivery transaction. The generic XMP sidecar core is contract-tested; no Lightroom or Photoshop compatibility is inferred from that fact.
 
 The runtime dependency is `silverloupe==0.1.0`.
 
@@ -20,13 +20,15 @@ The runtime dependency is `silverloupe==0.1.0`.
 1. Confirm `run-state.json` exists and matches the intended output directory.
 2. Confirm `session.json`, assets, items, assessments, and decisions are readable.
 3. Check whether the run status is completed or partial.
-4. Stop before any requested Lightroom, Camera Raw, XMP, or other editor mutation.
+4. For metadata delivery, require an explicit target and a completed curation generation. Never choose XMP because a native capability is missing.
 
-Why: a static recommendation can be reviewed safely without claiming an integration that has not been verified.
+Why: planning is non-mutating, and an unavailable or unverified editor profile can remain report-only without improvising a writer.
 
 ## Contract map
 
-If you need report sections, artifact provenance, override behavior, or the report-only boundary, read [runtime contracts](../../resources/contracts.md) completely before delivery.
+If you need report sections, artifact provenance, override behavior, or transaction contracts, read [runtime contracts](../../resources/contracts.md) completely before delivery.
+
+When the requested target is Lightroom Classic, read [the Lightroom adapter](../../resources/adapters/lightroom.md). When it is Photoshop, Bridge, or Camera Raw, read [the Photoshop adapter](../../resources/adapters/photoshop.md). Read only the relevant adapter.
 
 Do not load genre guides during report publication. The report displays the provenance already produced by curation.
 
@@ -85,15 +87,21 @@ silverloupe apply-overrides OUTPUT OVERRIDES_JSON
 
 The command rebuilds curation and the report. Excluding an item from top or selects changes its tier; it does not mark the photograph as a technical reject.
 
-## Report-only boundary
+## Metadata transaction
 
-Until verified delivery backends are available, respond to editor-write requests with a clear limitation:
+Build and inspect a plan before every mutation:
 
-- no Lightroom star or flag writes;
-- no Camera Raw or XMP mutation;
-- no fallback writer selected silently;
-- no claim that an installed editor proves compatibility;
-- no original image modification.
+```text
+silverloupe delivery-plan OUTPUT --target TARGET
+silverloupe delivery-apply OUTPUT
+silverloupe delivery-rollback OUTPUT
+```
+
+`xmp-sidecar` is an explicit low-level route for proprietary RAW sidecars. It stages bytes under `OUTPUT`, backs up an existing sidecar, checks source/sidecar preimages, merges owned fields, reads them back, and journals each target. It never changes image bytes or `.lrcat`.
+
+For a revised selection, rebuild with `--previous-receipt DELIVERY_RECEIPT`. Proposed rejects remain a suggested-reject keyword unless they have user/validated-policy authority or `--accept-reject-hash` matches the exact batch.
+
+Lightroom/Photoshop targets remain report-only while their adapter says `not-tested`. No fallback writer is selected silently, and installed software is not compatibility proof.
 
 Provide the static report path as the supported deliverable.
 
@@ -105,11 +113,14 @@ Provide the static report path as the supported deliverable.
 - [ ] partial status and missing evidence are visible;
 - [ ] all five review sections are present, including empty sections;
 - [ ] provenance and alternatives are visible;
-- [ ] report-only and unavailable metrics are explicit.
+- [ ] target/backend selection is explicit;
+- [ ] plan conflicts and report-only fields are visible;
+- [ ] complete/partial receipt and backup paths are recorded;
+- [ ] unavailable compatibility evidence remains explicit.
 
 ## Stop conditions
 
-Stop when state is stale or malformed, report publication is interrupted, a preview path escapes output, or the request requires an unverified editor mutation.
+Stop when state is stale or malformed, report publication is interrupted, a path escapes its root, a preimage changed, a receipt postimage changed, or the requested editor/format row is unverified.
 
 Do not start an interactive cards or swipe server. Do not represent the static report as an acceptance UI or delivery receipt.
 
@@ -119,4 +130,7 @@ Do not start an interactive cards or swipe server. Do not represent the static r
 - Treating partial as completed because the report renders.
 - Omitting empty review/reject sections and hiding their meaning.
 - Turning an override exclusion into reject.
+- Accepting a proposed reject without an exact batch hash.
+- Replacing a user rating or all keywords without prior field ownership.
+- Treating contract-tested XMP merge as an Adobe application round trip.
 - Promising editor synchronization because Lightroom is installed.

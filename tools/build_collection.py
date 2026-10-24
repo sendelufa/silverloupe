@@ -26,6 +26,8 @@ _RUNTIME_REFERENCES = {
     "../../resources/genres/wedding.md": "references/genres/wedding.md",
     "../../resources/genres/architecture.md": "references/genres/architecture.md",
     "../../resources/genres/landscape.md": "references/genres/landscape.md",
+    "../../resources/adapters/lightroom.md": "references/adapters/lightroom.md",
+    "../../resources/adapters/photoshop.md": "references/adapters/photoshop.md",
 }
 _DEV_REFERENCES = {
     "../../../evals/cases/routing.jsonl": "references/routing.jsonl",

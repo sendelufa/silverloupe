@@ -8,6 +8,9 @@ This reference defines the stable runtime interface used by the production skill
 silverloupe run SOURCE OUTPUT --brief BRIEF_JSON
 silverloupe report OUTPUT
 silverloupe apply-overrides OUTPUT OVERRIDES_JSON
+silverloupe delivery-plan OUTPUT --target TARGET
+silverloupe delivery-apply OUTPUT
+silverloupe delivery-rollback OUTPUT
 silverloupe prepare SOURCE OUTPUT
 silverloupe group OUTPUT
 silverloupe assess OUTPUT
@@ -85,8 +88,16 @@ The override file is a JSON array. Each object contains:
 
 `selection_scope` is `top` or `selects`; `action` is `include` or `exclude`. Every override in one request must target the active session revision and a unique known item. Excluding from a set changes tier; it does not produce technical reject.
 
-## Report and delivery boundary
+## Report and delivery transaction
 
 The report is static HTML. It shows top, selects, review, reject, reserve, reasons, provenance, comparisons, coverage, constraints, protected source sets, and unavailable quality metrics. It does not mutate state.
 
-Version 0.1.0 provides report-only delivery. It does not write Lightroom ratings, editor flags, XMP, develop settings, or original files. A missing verified editor backend is a stopping condition, not permission to improvise a writer.
+`delivery-plan` requires completed curation and writes `delivery-plan.json` without changing source metadata. The target is explicit: a missing native capability never selects XMP. A report-only plan is a safe result for an unsupported editor/version/format.
+
+`delivery-apply` consumes the exact persisted plan and writes `delivery-receipt.json`. The contract-tested `xmp-sidecar` backend is limited to adjacent sidecars for proprietary RAW files. It checks source and metadata preimages, preserves unknown XMP/develop properties, owns keywords element-by-element, stages and backs up bytes under the output root, atomically replaces one sidecar at a time, reads owned fields back, and journals partial progress. It never changes `.lrcat`, image bytes, or ACR sidecars.
+
+`delivery-rollback` writes `delivery-rollback-receipt.json`. Rollback is conflict-safe: it restores an exact backup or removes a newly created sidecar only while the current postimage still matches the apply receipt. A later editor/user change is preserved and reported as a conflict.
+
+Proposed reject does not become an Adobe reject value during ordinary delivery. It requires user or validated-policy authority, or an acceptance hash matching the exact displayed proposed-reject batch. A prior receipt is required to update or clear Silverloupe-owned fields after a selection change; user values without ownership remain conflicts.
+
+The generic XMP transaction tests do not prove Lightroom or Photoshop compatibility. Any application profile marked `not-tested` remains report-only until its exact round trip, develop preservation, fields, flags, color labels, versions, platform, and fixture hashes are recorded.
