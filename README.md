@@ -6,7 +6,7 @@ Silverloupe — проект проверяемого ассистированн
 
 ## Текущий статус
 
-**Реализованы контракты данных, deterministic eval-harness, диагностика окружения, read-only подготовка съёмки, консервативная группировка, recommendation-only техническая оценка с проверяемым host-vision exchange и жанровая редактура с наборами `selects` / `top`.** Перенос разметки в редакторы пока не реализован.
+**Реализован первый полный recommendation-only workflow:** read-only подготовка, консервативная группировка, проверяемый host-vision exchange, жанровая редактура, статический отчёт и revision-bound ручные исправления. Перенос разметки в редакторы пока не реализован.
 
 | Возможность | Статус |
 |---|---|
@@ -23,8 +23,9 @@ Silverloupe — проект проверяемого ассистированн
 | Локальные технические сигналы и безопасный triage | Готово |
 | Проверяемый `vision-request` / `vision-import` | Готово |
 | Жанровая редактура и итоговые `selects` / `top` | Готово (качество на реальных фото ещё не подтверждено) |
-| Отчёт, ручные исправления и перенос в редакторы | Запланировано |
-| Production-набор из шести скиллов и установщик | Запланировано |
+| Статический отчёт и revision-bound ручные исправления | Готово |
+| Production-набор из шести скиллов и отдельный dev-toolkit | Готово |
+| Перенос разметки в редакторы | Запланировано в Issues #7–8 |
 
 Актуальные этапы и критерии готовности находятся в [плане разработки](docs/superpowers/plans/2026-10-22-silverloupe.md) и [GitHub Issues](https://github.com/sendelufa/silverloupe/issues).
 
@@ -59,6 +60,81 @@ uv run --locked silverloupe doctor
 - host-vision capability.
 
 Статусы `degraded` и `unavailable` — диагностический результат, а не скрытый успех. Например, отсутствие ExifTool или vision будет явно отражено в JSON.
+
+### Первый пользовательский workflow
+
+Создайте строгий brief JSON. Неизвестные поля отклоняются, а отсутствующие события, люди и требования не додумываются:
+
+```json
+{
+  "schema_version": 1,
+  "genres": ["wedding"],
+  "purpose": "client story",
+  "top_k": 40,
+  "coverage_checklist": ["ceremony", "portraits", "reception"]
+}
+```
+
+Запустите полный безопасный pipeline одной командой:
+
+```bash
+uv run --locked silverloupe run /path/to/photos /path/to/output --brief /path/to/brief.json
+```
+
+Код `0` означает завершённый отбор. Код `3` означает честный `partial`: подготовка, оценки, `vision-request.json`, `run-state.json` и static report уже доступны, но `selection.json` не публикуется как завершённый результат. Просмотрите только перечисленные в запросе превью, сформируйте строгий response и импортируйте его:
+
+```bash
+uv run --locked silverloupe vision-import /path/to/output /path/to/vision-response.json
+uv run --locked silverloupe run /path/to/photos /path/to/output --brief /path/to/brief.json
+```
+
+Повторно собрать отчёт из сохранённого состояния можно без анализа фотографий:
+
+```bash
+uv run --locked silverloupe report /path/to/output
+```
+
+Отчёт находится в `output/report/index.html`. Это static, полностью локальный и неинтерактивный HTML без сервера, карточек, свайпов и state-changing JavaScript. В нём всегда есть разделы Top, Selects, Review, Reject и Reserve, причины, alternatives, provenance, coverage, constraints и честные ограничения photo-eval.
+
+Для ручной коррекции создайте JSON-массив с текущим `revision` из `session.json`:
+
+```json
+[
+  {
+    "schema_version": 1,
+    "item_id": "item-id",
+    "revision": 2,
+    "selection_scope": "top",
+    "action": "exclude",
+    "reason": "client prefers the alternate expression"
+  }
+]
+```
+
+Примените правку и перестройте отчёт:
+
+```bash
+uv run --locked silverloupe apply-overrides /path/to/output /path/to/overrides.json
+```
+
+Исключение из `top` переводит item в selects, исключение из `selects` — в reserve. Ни одно из этих действий не создаёт технический reject. Правка привязана к revision, получает user authority и сохраняется при повторном `run`.
+
+Delivery в версии 0.1.0 остаётся **report-only** до Issues #7–8: Silverloupe не записывает звёзды, flags, XMP или develop settings в Lightroom, Camera Raw и другие редакторы.
+
+### Production skills и dev-toolkit
+
+Production runtime содержит ровно шесть скиллов: `silverloupe`, `silverloupe-prepare`, `silverloupe-triage`, `silverloupe-compare`, `silverloupe-curate` и `silverloupe-deliver`. Их ссылки замкнуты внутри сборки.
+
+Отдельный dev-toolkit содержит только `silverloupe-eval`, routing corpus и baselines. Он не устанавливается фотографу и не попадает в production runtime.
+
+Собрать артефакты можно в пустые каталоги:
+
+```bash
+uv run --locked python tools/build_collection.py . dist/runtime --kind runtime
+uv run --locked python tools/build_collection.py . dist/dev-toolkit --kind dev-toolkit
+```
+
+Builder использует allowlist, отклоняет symlink/traversal, переписывает ссылки в bundle-local references и создаёт детерминированный `manifest.json` с SHA-256.
 
 ### Подготовить свою папку
 

@@ -212,3 +212,27 @@ def test_bundle_builder_rejects_nonempty_destination_traversal_and_symlink_sourc
     skill.write_text(skill.read_text() + "\n[escape](../../../outside.md)\n", encoding="utf-8")
     with pytest.raises(ValueError, match="reference"):
         build_collection(malicious, tmp_path / "traversal-output", kind="runtime")
+
+
+def test_issue6_documentation_and_two_host_smoke_are_versioned() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    for phrase in (
+        "silverloupe run",
+        "silverloupe report",
+        "silverloupe apply-overrides",
+        "vision-request.json",
+        "static",
+        "report-only",
+        "dev-toolkit",
+    ):
+        assert phrase in readme
+
+    records = _read_jsonl(ROOT / "evals/baselines/issue-6-host-smoke.jsonl")
+    assert {record["host"] for record in records} == {"codex", "claude-code"}
+    assert all(record["schema_version"] == 1 for record in records)
+    assert all(record["cli_version"] for record in records)
+    assert all(record["status"] in {"passed", "failed", "unavailable"} for record in records)
+    assert all(record["trace_visibility"] in {"available", "unavailable"} for record in records)
+    assert all(isinstance(record["observable_actions"], list) for record in records)
+    assert all(isinstance(record["artifact_paths"], list) for record in records)
+    assert all("private_reasoning" not in record for record in records)

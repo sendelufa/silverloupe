@@ -16,6 +16,7 @@ from silverloupe.report import build_report
 from silverloupe.triage import import_vision_response_prepared
 from silverloupe.vision.base import VisionRequest, VisionResponse, VisionObservation
 from silverloupe.workflow import apply_overrides, load_run_state, run_session
+from tools.build_collection import build_collection
 
 
 def _image(path: Path, color: tuple[int, int, int]) -> None:
@@ -282,6 +283,18 @@ def test_partial_report_discloses_missing_visual_evidence(tmp_path: Path) -> Non
     assert "<script" not in document.lower()
 
 
+def test_report_cards_keep_details_readable_in_multi_card_sections(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    _image(source / "a.jpg", (20, 40, 60))
+    _image(source / "b.jpg", (80, 100, 120))
+
+    document = build_report(run_session(_config(source, output))).read_text(encoding="utf-8")
+
+    assert "repeat(auto-fit, minmax(260px, 1fr))" in document
+    assert "dl { display: grid; grid-template-columns: minmax(0, 1fr)" in document
+
+
 def test_complete_report_shows_all_sections_and_provenance(tmp_path: Path) -> None:
     _source, output = _completed_run(tmp_path)
 
@@ -429,3 +442,78 @@ def test_cli_run_reports_io_failure_as_exit_four(
     monkeypatch.setattr("silverloupe.cli.run_session", fail_io)
     assert main(["run", str(tmp_path / "source"), str(tmp_path / "output"), "--brief", str(brief)]) == 4
     assert "disk unavailable" in capsys.readouterr().err
+
+
+def test_full_cli_round_trip_and_built_runtime_are_source_independent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = tmp_path / "input photos"
+    output = tmp_path / "review output"
+    clean_cwd = tmp_path / "clean host cwd"
+    clean_cwd.mkdir()
+    _image(source / "one.jpg", (20, 40, 60))
+    _image(source / "two.jpg", (80, 100, 120))
+    before = _hashes(source)
+    brief = tmp_path / "brief.json"
+    brief.write_text(Brief(genres=["architecture"], top_k=1).model_dump_json(), encoding="utf-8")
+    runtime = tmp_path / "installed runtime"
+    build_collection(Path(__file__).parents[2], runtime, kind="runtime")
+    monkeypatch.chdir(clean_cwd)
+
+    assert main(["run", str(source), str(output), "--brief", str(brief)]) == 3
+    partial = json.loads(capsys.readouterr().out)
+    assert Path(partial["report"]).is_file()
+    assert not (output / "selection.json").exists()
+
+    request = VisionRequest.model_validate_json((output / "vision-request.json").read_text())
+    response = VisionResponse(
+        request_id=request.request_id,
+        status="completed",
+        observations=[
+            VisionObservation(
+                asset_id=asset.asset_id,
+                observed_artifact_ids=asset.artifact_ids,
+                visual_criteria={criterion: "acceptable" for criterion in asset.criteria},
+            )
+            for asset in request.assets
+        ],
+    )
+    response_path = tmp_path / "vision response.json"
+    response_path.write_text(response.model_dump_json(), encoding="utf-8")
+    assert main(["vision-import", str(output), str(response_path)]) == 0
+    capsys.readouterr()
+    assert main(["run", str(source), str(output), "--brief", str(brief)]) == 0
+    capsys.readouterr()
+
+    session = json.loads((output / "session.json").read_text())
+    selection = json.loads((output / "selection.json").read_text())
+    corrected_id = selection["top_ids"][0]
+    overrides = tmp_path / "overrides.json"
+    overrides.write_text(
+        json.dumps(
+            [
+                {
+                    "schema_version": 1,
+                    "item_id": corrected_id,
+                    "revision": session["revision"],
+                    "selection_scope": "top",
+                    "action": "exclude",
+                    "reason": "manual E2E correction",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert main(["apply-overrides", str(output), str(overrides)]) == 0
+    corrected = json.loads(capsys.readouterr().out)
+    assert corrected["revision"] == session["revision"] + 1
+    assert main(["run", str(source), str(output), "--brief", str(brief)]) == 0
+    capsys.readouterr()
+
+    decisions = [json.loads(line) for line in (output / "decisions.jsonl").read_text().splitlines()]
+    corrected_decision = next(value for value in decisions if value["item_id"] == corrected_id)
+    assert corrected_decision["decision_authority"] == "user"
+    assert corrected_decision["tier"] == "select"
+    assert _hashes(source) == before
+    assert not any(part in {"evals", "tests", "docs"} for path in runtime.rglob("*") for part in path.parts)
+    assert all(str(Path(__file__).parents[2]) not in path.read_text(encoding="utf-8") for path in runtime.rglob("*.md"))
