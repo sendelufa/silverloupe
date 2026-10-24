@@ -337,7 +337,7 @@ class InstallConfig(ContractModel):
         str, Literal["native", "file", "report-only"]
     ]
     metadata_mapping_by_editor: dict[str, dict[str, str]] = Field(default_factory=dict)
-    runtime_version: str = Field(min_length=1)
+    runtime_version: str = Field(pattern=r"^[0-9]+(?:\.[0-9A-Za-z-]+)*$")
     model_mode: Literal[
         "host-vision", "local-signals", "api", "local-vision"
     ] = "host-vision"

@@ -4,10 +4,54 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Sequence
+
+
+_VERSION_PATTERN = re.compile(r"^[0-9]+(?:\.[0-9A-Za-z-]+)*$")
+
+
+def _verify_release_root(release_root: Path) -> dict[str, object]:
+    """Verify every release byte before importing the bundled runtime."""
+
+    if release_root.is_symlink() or not release_root.is_dir():
+        raise ValueError("release root is missing or unsafe")
+    files: dict[str, bytes] = {}
+    for candidate in sorted(release_root.rglob("*")):
+        if candidate.is_symlink():
+            raise ValueError(f"release contains a symlink: {candidate}")
+        if candidate.is_file():
+            relative = candidate.relative_to(release_root).as_posix()
+            if ".." in Path(relative).parts:
+                raise ValueError(f"unsafe release path: {relative}")
+            files[relative] = candidate.read_bytes()
+    try:
+        manifest = json.loads(files["manifest.json"])
+        checksums = json.loads(files["checksums.json"])
+    except KeyError as error:
+        raise ValueError(f"release metadata is missing: {error.args[0]}") from error
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"release metadata is invalid: {error}") from error
+    if not isinstance(manifest, dict) or not isinstance(checksums, dict):
+        raise ValueError("release metadata must contain JSON objects")
+    ownership = manifest.get("ownership")
+    if not isinstance(ownership, list) or set(ownership) != set(files):
+        raise ValueError("release ownership does not exactly match artifact files")
+    payload = set(files) - {"manifest.json", "checksums.json"}
+    if set(checksums) != payload:
+        raise ValueError("release checksums do not exactly cover payload files")
+    for relative, expected in checksums.items():
+        actual = hashlib.sha256(files[relative].encode() if isinstance(files[relative], str) else files[relative]).hexdigest()
+        if not isinstance(expected, str) or actual != expected:
+            raise ValueError(f"checksum mismatch for {relative}")
+    version = manifest.get("release_version")
+    if not isinstance(version, str) or not _VERSION_PATTERN.fullmatch(version):
+        raise ValueError("release manifest contains an invalid version")
+    return manifest
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -61,11 +105,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     release_root = Path(__file__).resolve().parent
     sys.dont_write_bytecode = True
+    try:
+        manifest = _verify_release_root(release_root)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
     sys.path.insert(0, str(release_root / "runtime/src"))
     from silverloupe.contracts import InstallConfig
+    from silverloupe.installer.capabilities import probe_install
     from silverloupe.installer.lifecycle import install_release
 
-    manifest = json.loads((release_root / "manifest.json").read_text(encoding="utf-8"))
     config = InstallConfig(
         hosts=hosts,
         scope=args.scope,
@@ -81,6 +130,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         install_raw_extra=args.raw,
     )
     result = install_release(release_root, config)
+    result["capabilities"] = probe_install(config)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
 

@@ -9,11 +9,20 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 from silverloupe.contracts import DeliveryPlan, DeliveryReceipt, InstallConfig
+from silverloupe.delivery.adobe import target_profile
 
 
 _FILE_FIELDS = {
     "lightroom-classic": ["keywords", "label", "rating"],
     "photoshop-camera-raw": ["keywords", "label", "rating"],
+}
+_FILE_TARGETS = {
+    "lightroom-classic": "lightroom-classic-xmp",
+    "photoshop-camera-raw": "photoshop-camera-raw-xmp",
+}
+_NATIVE_TARGETS = {
+    "lightroom-classic": "lightroom-classic-native",
+    "photoshop-camera-raw": "photoshop-native",
 }
 
 
@@ -92,6 +101,15 @@ def _editor_report(
             "fields": [],
         }
     if requested == "file":
+        profile = target_profile(_FILE_TARGETS[editor])
+        if not profile.verified:
+            return {
+                "requested_mode": "file",
+                "effective_mode": "report-only",
+                "status": "unavailable",
+                "fields": _FILE_FIELDS[editor],
+                "reason": profile.reason,
+            }
         return {
             "requested_mode": "file",
             "effective_mode": "file",
@@ -99,6 +117,23 @@ def _editor_report(
             "fields": _FILE_FIELDS[editor],
         }
 
+    if editor in _NATIVE_TARGETS:
+        profile = target_profile(_NATIVE_TARGETS[editor])
+        if not profile.verified:
+            return {
+                "requested_mode": "native",
+                "effective_mode": "report-only",
+                "status": "unavailable",
+                "fields": [],
+                "reason": profile.reason,
+                "per_host": {
+                    host: {
+                        "status": "unavailable",
+                        "reason": profile.reason or "native integration unavailable",
+                    }
+                    for host in config.hosts
+                },
+            }
     raw = values.get(editor, {})
     details = raw if isinstance(raw, Mapping) else {}
     native_by_host = details.get("native_by_host", {})

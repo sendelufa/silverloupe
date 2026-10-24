@@ -4,6 +4,7 @@ from pathlib import Path
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -12,7 +13,9 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from silverloupe.contracts import DeliveryPlan, DeliveryReceipt, InstallConfig
+from silverloupe.cli import main as cli_main
+from silverloupe.contracts import DeliveryPlan, DeliveryReceipt, InstallConfig, SessionConfig
+import silverloupe.installer.lifecycle as lifecycle_module
 from silverloupe.installer.capabilities import MetadataBackend, probe_install
 from silverloupe.installer.config import configure_editor
 from silverloupe.installer.lifecycle import (
@@ -181,10 +184,11 @@ def test_explicit_file_mode_reports_xmp_fields_and_does_not_probe_native(
 
     editor = report["editors"]["lightroom-classic"]
     assert editor == {
-        "effective_mode": "file",
+        "effective_mode": "report-only",
         "fields": ["keywords", "label", "rating"],
         "requested_mode": "file",
-        "status": "ready",
+        "reason": "editor_format_combination_not_verified",
+        "status": "unavailable",
     }
 
 
@@ -251,7 +255,7 @@ def test_clean_install_registers_exactly_six_skills_for_each_selected_host(
     assert launcher.is_file()
     assert launcher.stat().st_mode & 0o111
     for host in hosts:
-        host_root = home / (".codex" if host == "codex" else ".claude") / "skills"
+        host_root = home / (".agents" if host == "codex" else ".claude") / "skills"
         assert {path.name for path in host_root.iterdir()} == set(PRODUCTION_SKILLS)
         entry_skill = (host_root / "silverloupe/SKILL.md").read_text(encoding="utf-8")
         assert str(launcher) in entry_skill
@@ -291,9 +295,9 @@ def test_project_scope_registers_skills_inside_install_root(
     install_release(artifact, config)
 
     install_root = Path(config.install_root)
-    assert (install_root / ".codex/skills/silverloupe/SKILL.md").is_file()
+    assert (install_root / ".agents/skills/silverloupe/SKILL.md").is_file()
     assert (install_root / ".claude/skills/silverloupe/SKILL.md").is_file()
-    assert not (home / ".codex/skills/silverloupe").exists()
+    assert not (home / ".agents/skills/silverloupe").exists()
     assert not (home / ".claude/skills/silverloupe").exists()
 
 
@@ -428,7 +432,7 @@ def test_uninstall_removes_only_owned_files_and_preserves_foreign_data(
     assert foreign.read_text() == "mine\n"
     assert session.read_text() == "{}\n"
     assert external_photo.read_bytes() == b"photo"
-    assert not (home / ".codex/skills/silverloupe").exists()
+    assert not (home / ".agents/skills/silverloupe").exists()
     assert not (Path(config.install_root) / ".silverloupe").exists()
 
 
@@ -467,3 +471,209 @@ def test_release_bootstrap_cli_installs_without_source_checkout_on_pythonpath(
 
     assert json.loads(completed.stdout)["status"] == "installed"
     assert (install_root / ".silverloupe/active-version").read_text() == "0.1.0\n"
+
+
+def test_bootstrap_verifies_release_before_importing_runtime_code(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    artifact = build_release(ROOT, tmp_path / "dist", "0.1.0")
+    unpacked = tmp_path / "unpacked"
+    with tarfile.open(artifact, "r:gz") as handle:
+        handle.extractall(unpacked, filter="data")
+    release = unpacked / "silverloupe-0.1.0"
+    marker = tmp_path / "runtime-executed"
+    runtime_init = release / "runtime/src/silverloupe/__init__.py"
+    runtime_init.write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\n"
+        + runtime_init.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(release / "install.py"),
+            "--host",
+            "codex",
+            "--editor",
+            "report-only",
+            "--install-root",
+            str(tmp_path / "install"),
+        ],
+        cwd=tmp_path,
+        env={"HOME": str(home), "PATH": os.environ.get("PATH", "")},
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "checksum" in completed.stderr
+    assert not marker.exists()
+
+
+def test_release_version_metadata_cannot_escape_versions_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    artifact = build_release(ROOT, tmp_path / "dist", "0.1.0")
+    unpacked = tmp_path / "unpacked"
+    with tarfile.open(artifact, "r:gz") as handle:
+        handle.extractall(unpacked, filter="data")
+    release = unpacked / "silverloupe-0.1.0"
+    manifest_path = release / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["release_version"] = "../../escaped-release"
+    manifest_path.write_text(json.dumps(manifest))
+    config = _config(tmp_path).model_copy(update={"runtime_version": "../../escaped-release"})
+
+    with pytest.raises(ValueError, match="version"):
+        install_release(release, config)
+
+    assert not (tmp_path / "escaped-release").exists()
+
+
+def test_activation_write_failure_rolls_back_config_launcher_and_host_skills(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    first_artifact = build_release(ROOT, tmp_path / "dist-1", "0.1.0")
+    second_artifact = build_release(ROOT, tmp_path / "dist-2", "0.2.0")
+    first = _config(tmp_path)
+    install_release(first_artifact, first)
+    install_root = Path(first.install_root)
+    state_root = install_root / ".silverloupe"
+    skill_path = home / ".agents/skills/silverloupe/SKILL.md"
+    before = {
+        "active": (state_root / "active-version").read_bytes(),
+        "config": (state_root / "config.json").read_bytes(),
+        "launcher": (install_root / "bin/silverloupe").read_bytes(),
+        "skill": skill_path.read_bytes(),
+    }
+    real_atomic_write = lifecycle_module.atomic_write_text
+
+    def fail_active(path: Path, text: str) -> None:
+        if path.name == "active-version" and text == "0.2.0\n":
+            raise OSError("injected active pointer failure")
+        real_atomic_write(path, text)
+
+    monkeypatch.setattr(lifecycle_module, "atomic_write_text", fail_active)
+    second = configure_editor(
+        first.model_copy(update={"runtime_version": "0.2.0"}),
+        "lightroom-classic",
+        "file",
+    )
+
+    with pytest.raises(OSError, match="active pointer"):
+        update_release(second_artifact, second)
+
+    assert (state_root / "active-version").read_bytes() == before["active"]
+    assert (state_root / "config.json").read_bytes() == before["config"]
+    assert (install_root / "bin/silverloupe").read_bytes() == before["launcher"]
+    assert skill_path.read_bytes() == before["skill"]
+    assert not (install_root / "versions/0.2.0").exists()
+
+
+def test_uninstall_preserves_external_files_behind_replaced_parent_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    artifact = build_release(ROOT, tmp_path / "dist", "0.1.0")
+    config = _config(tmp_path)
+    install_release(artifact, config)
+    installed_skill = home / ".agents/skills/silverloupe"
+    external = tmp_path / "external-skill"
+    shutil.copytree(installed_skill, external)
+    shutil.rmtree(installed_skill)
+    installed_skill.symlink_to(external, target_is_directory=True)
+
+    result = uninstall_release(config)
+
+    assert (external / "SKILL.md").is_file()
+    assert result["preserved"]
+
+
+def test_new_session_uses_installed_model_budget_and_editor_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    artifact = build_release(ROOT, tmp_path / "dist", "0.1.0")
+    config = _config(
+        tmp_path,
+        enabled_editors=["lightcraft"],
+        default_editor="lightcraft",
+        integration_mode_by_editor={"lightcraft": "native"},
+        model_mode="local-signals",
+        cache_quota=123456,
+        worker_limit=1,
+    )
+    install_release(artifact, config)
+    monkeypatch.setenv("SILVERLOUPE_INSTALL_ROOT", config.install_root)
+    source = ROOT / "evals/fixtures/files"
+    output = tmp_path / "session"
+
+    assert cli_main(["prepare", str(source), str(output)]) == 0
+
+    session = SessionConfig.model_validate_json((output / "session.json").read_text())
+    assert session.runtime_mode == "local"
+    assert session.budget == {"cache_quota": 123456, "worker_limit": 1}
+    assert session.editor_config_snapshot["default_editor"] == "lightcraft"
+    assert session.editor_config_snapshot["integration_mode"] == "native"
+
+
+def test_install_refuses_to_overwrite_unowned_launcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    artifact = build_release(ROOT, tmp_path / "dist", "0.1.0")
+    config = _config(tmp_path)
+    launcher = Path(config.install_root) / "bin/silverloupe"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("foreign\n")
+
+    with pytest.raises(ValueError, match="launcher"):
+        install_release(artifact, config)
+
+    assert launcher.read_text() == "foreign\n"
+
+
+def test_management_cli_reports_capabilities_configures_updates_and_uninstalls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    first_artifact = build_release(ROOT, tmp_path / "dist-1", "0.1.0")
+    second_artifact = build_release(ROOT, tmp_path / "dist-2", "0.2.0")
+    config = _config(tmp_path)
+    install_release(first_artifact, config)
+    monkeypatch.setenv("SILVERLOUPE_INSTALL_ROOT", config.install_root)
+
+    assert cli_main(["doctor"]) == 0
+    doctor = json.loads(capsys.readouterr().out)
+    assert "installation" in doctor
+    assert cli_main(["configure", "--editor", "lightroom-classic", "--mode", "file"]) == 0
+    capsys.readouterr()
+    assert load_installed_config(Path(config.install_root)).default_editor == "lightroom-classic"
+    assert cli_main(["update", str(second_artifact)]) == 0
+    capsys.readouterr()
+    assert load_installed_config(Path(config.install_root)).runtime_version == "0.2.0"
+    assert cli_main(["uninstall"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "uninstalled"

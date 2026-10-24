@@ -20,6 +20,10 @@ uv run --python 3.12 --no-project \
 `file` выбирается явно и не включается автоматически. Без доступного writer
 Silverloupe остаётся в безопасном режиме `report-only`.
 
+Codex-скиллы регистрируются в `.agents/skills`, Claude Code — в
+`.claude/skills`. При `--scope user` это каталоги домашней директории, при
+`--scope project` — каталоги внутри выбранного `install-root`.
+
 Архив содержит только шесть рабочих скиллов и production runtime. Фото-evals,
 тесты и инструменты разработчика в пользовательскую поставку не входят.
 
@@ -51,6 +55,19 @@ Silverloupe остаётся в безопасном режиме `report-only`.
 Удаление читает ownership manifest и удаляет только неизменённые файлы
 Silverloupe. Чужие скиллы, фотографии, результаты и каталоги сессий остаются.
 Изменённый owned-файл также сохраняется и перечисляется в результате удаления.
+
+Установленный launcher предоставляет управление без dev-checkout:
+
+```bash
+/path/to/install-root/bin/silverloupe doctor
+/path/to/install-root/bin/silverloupe configure --editor lightroom-classic --mode file
+/path/to/install-root/bin/silverloupe update /path/to/silverloupe-VERSION.tar.gz
+/path/to/install-root/bin/silverloupe uninstall
+```
+
+`doctor` показывает выбранные host/editor/model возможности. Если конкретный
+Adobe/XMP маршрут ещё не подтверждён release-матрицей, выбранный `file` режим
+остаётся `report-only`, а не объявляется готовым writer.
 
 Публикация install-репозитория или GitHub release — отдельное release-действие:
 сборщик только создаёт проверяемый архив и не отправляет его во внешний сервис.

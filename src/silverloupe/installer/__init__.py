@@ -5,6 +5,7 @@ from silverloupe.installer.config import configure_editor
 from silverloupe.installer.lifecycle import (
     install_release,
     load_installed_config,
+    read_release_manifest,
     uninstall_release,
     update_release,
 )
@@ -15,6 +16,7 @@ __all__ = [
     "install_release",
     "load_installed_config",
     "probe_install",
+    "read_release_manifest",
     "uninstall_release",
     "update_release",
 ]

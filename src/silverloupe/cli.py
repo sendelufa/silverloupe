@@ -21,8 +21,10 @@ from silverloupe.contracts import (
     Decision,
     DeliveryPlan,
     DeliveryReceipt,
+    InstallConfig,
     Manifest,
     RunConfig,
+    RuntimeMode,
     SelectionItem,
     SelectionOverride,
     SessionConfig,
@@ -31,6 +33,14 @@ from silverloupe.curation import curate_prepared
 from silverloupe.delivery import apply_delivery, plan_delivery, rollback_delivery
 from silverloupe.grouping import group_prepared
 from silverloupe.inventory import prepare, resume
+from silverloupe.installer.capabilities import probe_install
+from silverloupe.installer.config import configure_editor
+from silverloupe.installer.lifecycle import (
+    load_installed_config,
+    read_release_manifest,
+    uninstall_release,
+    update_release,
+)
 from silverloupe.previews import validate_output_layout
 from silverloupe.report import build_report
 from silverloupe.state import atomic_write_text, read_status
@@ -51,7 +61,7 @@ def doctor_report() -> dict[str, Any]:
     vision_value = os.environ.get("SILVERLOUPE_VISION_CAPABILITY", "unavailable").strip().lower()
     vision_status = vision_value if vision_value in {"ready", "degraded", "unavailable"} else "unavailable"
 
-    return {
+    report = {
         "python": {
             "status": "ready" if python_ready else "degraded",
             "version": platform.python_version(),
@@ -75,6 +85,10 @@ def doctor_report() -> dict[str, Any]:
             **({"reason": "host vision capability was not declared"} if vision_status == "unavailable" else {}),
         },
     }
+    installed = _installed_config(required=False)
+    if installed is not None:
+        report["installation"] = probe_install(installed)
+    return report
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -145,6 +159,18 @@ def _parser() -> argparse.ArgumentParser:
         "delivery-rollback", help="roll back the persisted delivery receipt"
     )
     delivery_rollback_parser.add_argument("output")
+    configure_parser = subparsers.add_parser(
+        "configure", help="change the default editor for new sessions"
+    )
+    configure_parser.add_argument("--editor", required=True)
+    configure_parser.add_argument(
+        "--mode", required=True, choices=("native", "file", "report-only")
+    )
+    update_parser = subparsers.add_parser(
+        "update", help="verify and activate another production release"
+    )
+    update_parser.add_argument("artifact")
+    subparsers.add_parser("uninstall", help="remove only Silverloupe-owned files")
     return parser
 
 
@@ -172,6 +198,51 @@ def _session_revision(output: Path) -> int:
     return SessionConfig.model_validate_json(
         (output / "session.json").read_text(encoding="utf-8")
     ).revision
+
+
+def _installed_config(*, required: bool) -> InstallConfig | None:
+    raw_root = os.environ.get("SILVERLOUPE_INSTALL_ROOT")
+    if not raw_root:
+        if required:
+            raise ValueError("SILVERLOUPE_INSTALL_ROOT is not set")
+        return None
+    try:
+        return load_installed_config(Path(raw_root).expanduser().resolve())
+    except FileNotFoundError:
+        if required:
+            raise
+        return None
+
+
+def _installed_run_settings() -> dict[str, Any]:
+    config = _installed_config(required=False)
+    if config is None:
+        return {}
+    runtime_mode = {
+        "host-vision": RuntimeMode.HOST_VISION,
+        "api": RuntimeMode.API,
+        "local-signals": RuntimeMode.LOCAL,
+        "local-vision": RuntimeMode.LOCAL,
+    }[config.model_mode]
+    return {
+        "runtime_mode": runtime_mode,
+        "budget": {
+            "cache_quota": config.cache_quota,
+            "worker_limit": config.worker_limit,
+        },
+        "editor_config_snapshot": {
+            "config_version": config.config_version,
+            "enabled_editors": list(config.enabled_editors),
+            "default_editor": config.default_editor,
+            "integration_mode": config.integration_mode_by_editor[
+                config.default_editor
+            ],
+            "metadata_mapping": config.metadata_mapping_by_editor.get(
+                config.default_editor, {}
+            ),
+            "runtime_version": config.runtime_version,
+        },
+    }
 
 
 def _model_file(path: Path, model: type[Any]) -> Any:
@@ -240,6 +311,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "doctor":
             print(json.dumps(doctor_report(), ensure_ascii=False, sort_keys=True))
             return 0
+        if args.command == "configure":
+            installed = _installed_config(required=True)
+            assert installed is not None
+            configured = configure_editor(installed, args.editor, args.mode)
+            release = Path(installed.install_root) / "versions" / installed.runtime_version
+            result = update_release(release, configured)
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+            return 0
+        if args.command == "update":
+            installed = _installed_config(required=True)
+            assert installed is not None
+            artifact = Path(args.artifact).expanduser().resolve()
+            manifest = read_release_manifest(artifact)
+            configured = InstallConfig.model_validate(
+                {
+                    **installed.model_dump(mode="json"),
+                    "runtime_version": manifest["release_version"],
+                }
+            )
+            result = update_release(artifact, configured)
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+            return 0
+        if args.command == "uninstall":
+            installed = _installed_config(required=True)
+            assert installed is not None
+            result = uninstall_release(installed)
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+            return 0
         if args.command == "prepare":
             source = Path(args.source).expanduser().resolve()
             output = Path(args.output).expanduser().resolve()
@@ -248,6 +347,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_root=str(output),
                 brief=Brief(),
                 rendering_policy={"max_edge": args.max_edge},
+                **_installed_run_settings(),
             )
             manifest = prepare(source, output, config)
             unavailable = sum(asset.decode_status != "ready" for asset in manifest.assets)
@@ -384,6 +484,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     source_roots=[str(source)],
                     output_root=str(output),
                     brief=_brief(Path(args.brief).expanduser().resolve()),
+                    **_installed_run_settings(),
                 )
             )
             report_path = build_report(state)

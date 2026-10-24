@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import tarfile
 import uuid
 from pathlib import Path, PurePosixPath
@@ -18,6 +19,7 @@ from silverloupe.state import atomic_write_text
 
 
 _STATE_DIRECTORY = ".silverloupe"
+_VERSION_PATTERN = re.compile(r"^[0-9]+(?:\.[0-9A-Za-z-]+)*$")
 
 
 def _sha256(data: bytes) -> str:
@@ -104,8 +106,8 @@ def _verified_release(artifact: Path) -> tuple[dict[str, bytes], dict[str, Any]]
         if not isinstance(expected, str) or _sha256(files[relative]) != expected:
             raise ValueError(f"checksum mismatch for {relative}")
     version = manifest.get("release_version")
-    if not isinstance(version, str) or not version:
-        raise ValueError("release manifest lacks a version")
+    if not isinstance(version, str) or not _VERSION_PATTERN.fullmatch(version):
+        raise ValueError("release manifest contains an invalid version")
     return files, manifest
 
 
@@ -116,7 +118,7 @@ def _host_skill_root(config: InstallConfig, host: str) -> Path:
         else Path(config.install_root).expanduser().resolve()
     )
     if host == "codex":
-        return base / ".codex/skills"
+        return base / ".agents/skills"
     if host == "claude-code":
         return base / ".claude/skills"
     raise ValueError(f"unknown host: {host}")
@@ -159,6 +161,79 @@ def _ownership_map(ownership: dict[str, Any] | None) -> dict[Path, str]:
         ):
             result[Path(entry["path"])] = entry["sha256"]
     return result
+
+
+def _lstat(path: Path) -> os.stat_result | None:
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+
+
+def _remove_path(path: Path) -> None:
+    details = _lstat(path)
+    if details is None:
+        return
+    if stat.S_ISDIR(details.st_mode) and not stat.S_ISLNK(details.st_mode):
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _path_has_symlink_component(path: Path, root: Path) -> bool:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return True
+    current = root
+    components = [current]
+    for part in relative.parts[:-1]:
+        current = current / part
+        components.append(current)
+    return any(
+        details is not None and stat.S_ISLNK(details.st_mode)
+        for details in (_lstat(component) for component in components)
+    )
+
+
+def _owned_root(path: Path, roots: list[Path]) -> Path | None:
+    for root in roots:
+        if path == root or path.is_relative_to(root):
+            return root
+    return None
+
+
+def _snapshot_targets(targets: list[Path], snapshot_root: Path) -> list[tuple[Path, Path | None]]:
+    snapshots: list[tuple[Path, Path | None]] = []
+    for index, target in enumerate(targets):
+        details = _lstat(target)
+        if details is None:
+            snapshots.append((target, None))
+            continue
+        if stat.S_ISLNK(details.st_mode):
+            raise ValueError(f"transaction target is a symlink: {target}")
+        snapshot = snapshot_root / str(index)
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        if stat.S_ISDIR(details.st_mode):
+            shutil.copytree(target, snapshot, symlinks=True)
+        elif stat.S_ISREG(details.st_mode):
+            shutil.copy2(target, snapshot)
+        else:
+            raise ValueError(f"transaction target is not a regular file or directory: {target}")
+        snapshots.append((target, snapshot))
+    return snapshots
+
+
+def _restore_targets(snapshots: list[tuple[Path, Path | None]]) -> None:
+    for target, snapshot in reversed(snapshots):
+        _remove_path(target)
+        if snapshot is None:
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if snapshot.is_dir():
+            shutil.copytree(snapshot, target, symlinks=True)
+        else:
+            shutil.copy2(snapshot, target)
 
 
 def _write_stage(stage: Path, files: dict[str, bytes]) -> Path:
@@ -249,7 +324,9 @@ def _write_launcher(install_root: Path, version_root: Path, config: InstallConfi
         [
             "#!/bin/sh",
             "set -eu",
+            "export PYTHONDONTWRITEBYTECODE=1",
             f"export PYTHONPATH={shlex.quote(str(runtime_source))}",
+            f"export SILVERLOUPE_INSTALL_ROOT={shlex.quote(str(install_root))}",
             "exec uv run --python 3.12 --no-project "
             f"--with-requirements {shlex.quote(str(requirements))} "
             "python -c 'from silverloupe.cli import main; raise SystemExit(main())' "
@@ -269,7 +346,11 @@ def _file_entries(paths: list[Path]) -> list[dict[str, str]]:
     ]
 
 
-def _remove_owned_files(entries: list[dict[str, Any]], keep: set[Path]) -> list[str]:
+def _remove_owned_files(
+    entries: list[dict[str, Any]],
+    keep: set[Path],
+    roots: list[Path],
+) -> list[str]:
     preserved: list[str] = []
     for entry in sorted(entries, key=lambda value: len(str(value.get("path", ""))), reverse=True):
         raw_path = entry.get("path")
@@ -277,19 +358,35 @@ def _remove_owned_files(entries: list[dict[str, Any]], keep: set[Path]) -> list[
         if not isinstance(raw_path, str) or not isinstance(expected, str):
             continue
         path = Path(raw_path)
-        if path in keep or not path.exists():
+        if path in keep:
             continue
-        if path.is_symlink() or not path.is_file() or _sha256(path.read_bytes()) != expected:
+        root = _owned_root(path, roots)
+        details = _lstat(path)
+        if details is None:
+            continue
+        if (
+            root is None
+            or _path_has_symlink_component(path, root)
+            or not stat.S_ISREG(details.st_mode)
+            or _sha256(path.read_bytes()) != expected
+        ):
             preserved.append(str(path))
             continue
         path.unlink()
     return preserved
 
 
-def _remove_empty_directories(values: list[str]) -> None:
+def _remove_empty_directories(values: list[str], roots: list[Path]) -> None:
     for raw in sorted(set(values), key=len, reverse=True):
         path = Path(raw)
-        if path.is_symlink() or not path.is_dir():
+        root = _owned_root(path, roots)
+        details = _lstat(path)
+        if (
+            root is None
+            or details is None
+            or _path_has_symlink_component(path, root)
+            or not stat.S_ISDIR(details.st_mode)
+        ):
             continue
         try:
             path.rmdir()
@@ -311,7 +408,12 @@ def _activate_release(
         )
     install_root = Path(config.install_root).expanduser().resolve()
     state_root = _state_root(install_root)
+    if _lstat(state_root) is not None and _path_has_symlink_component(
+        state_root / "ownership.json", install_root
+    ):
+        raise ValueError("installer state path contains a symlink")
     prior = _load_ownership(install_root) if install_root.exists() else None
+    prior_owned = _ownership_map(prior)
     active_path = state_root / "active-version"
     if active_path.is_file() and active_path.read_text(encoding="utf-8") == f"{version}\n":
         try:
@@ -325,7 +427,7 @@ def _activate_release(
         raise ValueError(f"staging path already exists: {stage}")
     try:
         release = _write_stage(stage, files)
-        _preflight_host_targets(release, config, _ownership_map(prior))
+        _preflight_host_targets(release, config, prior_owned)
         if failpoint == "after_stage":
             raise RuntimeError("injected update failure after_stage")
 
@@ -333,58 +435,107 @@ def _activate_release(
         versions = install_root / "versions"
         versions.mkdir(exist_ok=True)
         version_root = versions / version
-        if not version_root.exists():
-            (stage / "release").replace(version_root)
-        else:
-            staged_hashes = {
-                path.relative_to(release).as_posix(): _sha256(path.read_bytes())
-                for path in _skill_files(release)
-            }
-            installed_hashes = {
-                path.relative_to(version_root).as_posix(): _sha256(path.read_bytes())
-                for path in _skill_files(version_root)
-            }
-            if staged_hashes != installed_hashes:
-                raise ValueError(f"installed version directory is not identical: {version_root}")
+        if not version_root.resolve().is_relative_to(versions.resolve()):
+            raise ValueError("release version escapes versions directory")
+        launcher = install_root / "bin/silverloupe"
+        launcher_details = _lstat(launcher)
+        if launcher_details is not None:
+            expected_launcher = prior_owned.get(launcher)
+            if (
+                expected_launcher is None
+                or not stat.S_ISREG(launcher_details.st_mode)
+                or _sha256(launcher.read_bytes()) != expected_launcher
+            ):
+                raise ValueError(f"launcher target is not owned by Silverloupe: {launcher}")
+        if prior is None and _lstat(state_root) is not None:
+            raise ValueError(f"installer state is unowned: {state_root}")
 
-        launcher = _write_launcher(install_root, version_root, config)
-        host_files, host_directories = _install_host_skills(
-            version_root, config, launcher
-        )
-        version_files = _skill_files(version_root)
-        version_directories = [
-            path for path in version_root.rglob("*") if path.is_dir()
-        ] + [version_root, versions]
-        state_root.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(state_root / "config.json", config.model_dump_json(indent=2) + "\n")
-        atomic_write_text(active_path, f"{version}\n")
-        owned_files = version_files + host_files + [launcher]
-        ownership = {
-            "schema_version": 1,
-            "active_version": version,
-            "files": _file_entries(owned_files),
-            "directories": [
-                str(path.resolve())
-                for path in sorted(
-                    set(version_directories + host_directories + [launcher.parent]),
-                    key=lambda value: str(value),
-                )
-            ],
-            "state_files": [
-                str((state_root / "active-version").resolve()),
-                str((state_root / "config.json").resolve()),
-                str((state_root / "ownership.json").resolve()),
-            ],
-        }
-        atomic_write_text(
+        skill_targets = [
+            _host_skill_root(config, host) / skill.name
+            for host in config.hosts
+            for skill in sorted(
+                (path for path in release.joinpath("skills").iterdir() if path.is_dir()),
+                key=lambda value: value.name,
+            )
+        ]
+        live_targets = [
+            launcher,
+            state_root / "config.json",
+            active_path,
             state_root / "ownership.json",
-            json.dumps(ownership, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        )
+            *skill_targets,
+        ]
+        snapshots = _snapshot_targets(live_targets, stage / "rollback")
+        created_version = False
+        try:
+            if not version_root.exists():
+                (stage / "release").replace(version_root)
+                created_version = True
+            else:
+                staged_hashes = {
+                    path.relative_to(release).as_posix(): _sha256(path.read_bytes())
+                    for path in _skill_files(release)
+                }
+                installed_hashes = {
+                    path.relative_to(version_root).as_posix(): _sha256(path.read_bytes())
+                    for path in _skill_files(version_root)
+                }
+                if staged_hashes != installed_hashes:
+                    raise ValueError(f"installed version directory is not identical: {version_root}")
+
+            launcher = _write_launcher(install_root, version_root, config)
+            host_files, host_directories = _install_host_skills(
+                version_root, config, launcher
+            )
+            version_files = _skill_files(version_root)
+            version_directories = [
+                path for path in version_root.rglob("*") if path.is_dir()
+            ] + [version_root, versions]
+            state_root.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(
+                state_root / "config.json", config.model_dump_json(indent=2) + "\n"
+            )
+            atomic_write_text(active_path, f"{version}\n")
+            owned_files = version_files + host_files + [launcher]
+            ownership_roots = [
+                install_root,
+                *[_host_skill_root(config, host) for host in config.hosts],
+            ]
+            ownership = {
+                "schema_version": 1,
+                "active_version": version,
+                "files": _file_entries(owned_files),
+                "directories": [
+                    str(path.resolve())
+                    for path in sorted(
+                        set(version_directories + host_directories + [launcher.parent]),
+                        key=lambda value: str(value),
+                    )
+                ],
+                "roots": [str(path) for path in ownership_roots],
+                "state_files": [
+                    str((state_root / "active-version").resolve()),
+                    str((state_root / "config.json").resolve()),
+                    str((state_root / "ownership.json").resolve()),
+                ],
+            }
+            atomic_write_text(
+                state_root / "ownership.json",
+                json.dumps(ownership, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            )
+        except Exception:
+            _restore_targets(snapshots)
+            if created_version:
+                _remove_path(version_root)
+            raise
 
         keep = {Path(entry["path"]) for entry in ownership["files"]}
         if prior is not None:
-            _remove_owned_files(prior.get("files", []), keep)
-            _remove_empty_directories(prior.get("directories", []))
+            prior_roots = [Path(value) for value in prior.get("roots", [])]
+            if not prior_roots:
+                prior_roots = [install_root, *ownership_roots[1:]]
+            _remove_owned_files(prior.get("files", []), keep, prior_roots)
+            _remove_empty_directories(prior.get("directories", []), prior_roots)
         status = "updated" if prior is not None else "installed"
         return {
             "status": status,
@@ -420,21 +571,47 @@ def uninstall_release(config: InstallConfig) -> dict[str, Any]:
     """Remove only unchanged files recorded as owned by this installation."""
 
     install_root = Path(config.install_root).expanduser().resolve()
+    state_root = _state_root(install_root)
+    if _path_has_symlink_component(state_root / "ownership.json", install_root):
+        raise ValueError("installer state path contains a symlink")
     ownership = _load_ownership(install_root)
     if ownership is None:
         return {"status": "not-installed", "preserved": []}
-    preserved = _remove_owned_files(ownership.get("files", []), set())
+    roots = [Path(value) for value in ownership.get("roots", []) if isinstance(value, str)]
+    if not roots:
+        roots = [
+            install_root,
+            *[_host_skill_root(config, host) for host in config.hosts],
+        ]
+    preserved = _remove_owned_files(ownership.get("files", []), set(), roots)
     for raw in ownership.get("state_files", []):
         if not isinstance(raw, str):
             continue
         path = Path(raw)
-        if path == _state_root(install_root) / "ownership.json":
+        if path == state_root / "ownership.json":
             continue
-        if path.is_file() and not path.is_symlink():
+        root = _owned_root(path, roots)
+        details = _lstat(path)
+        if (
+            root is not None
+            and details is not None
+            and not _path_has_symlink_component(path, root)
+            and stat.S_ISREG(details.st_mode)
+        ):
             path.unlink()
-    ownership_path = _state_root(install_root) / "ownership.json"
-    if ownership_path.is_file() and not ownership_path.is_symlink():
+    ownership_path = state_root / "ownership.json"
+    ownership_details = _lstat(ownership_path)
+    if ownership_details is not None and stat.S_ISREG(ownership_details.st_mode):
         ownership_path.unlink()
-    _remove_empty_directories(ownership.get("directories", []))
-    _remove_empty_directories([str(_state_root(install_root)), str(install_root / "versions")])
+    _remove_empty_directories(ownership.get("directories", []), roots)
+    _remove_empty_directories(
+        [str(state_root), str(install_root / "versions")], roots
+    )
     return {"status": "uninstalled", "preserved": sorted(preserved)}
+
+
+def read_release_manifest(artifact: Path) -> dict[str, Any]:
+    """Return verified release metadata without installing it."""
+
+    _files, manifest = _verified_release(artifact)
+    return manifest
