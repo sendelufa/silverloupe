@@ -242,7 +242,20 @@ class SelectionOverride(ContractModel):
 class AssetMapping(ContractModel):
     asset_id: str
     target_id: str
+    source_path: str | None = None
+    metadata_path: str | None = None
     expected_before: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def mapping_paths_are_relative(self) -> AssetMapping:
+        for name in ("source_path", "metadata_path"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            path = Path(value)
+            if path.is_absolute() or ".." in path.parts:
+                raise ValueError(f"{name} must stay relative to source_root")
+        return self
 
 
 class ProposedChange(ContractModel):
@@ -255,6 +268,14 @@ class ProposedChange(ContractModel):
 class DeliveryPlan(ContractModel):
     target: str
     profile_version: str
+    plan_id: str = ""
+    backend: Literal["xmp", "native", "unavailable"] = "unavailable"
+    status: Literal["ready", "report_only"] = "report_only"
+    source_root: str | None = None
+    output_root: str | None = None
+    journal_path: str | None = None
+    accepted_reject_hash: str | None = None
+    previous_receipt: dict[str, Any] = Field(default_factory=dict)
     asset_mappings: list[AssetMapping] = Field(default_factory=list)
     proposed_changes: list[ProposedChange] = Field(default_factory=list)
     conflicts: list[dict[str, Any]] = Field(default_factory=list)
@@ -263,12 +284,20 @@ class DeliveryPlan(ContractModel):
 class DeliveryOutcome(ContractModel):
     asset_id: str
     status: Literal["applied", "skipped", "failed"]
+    operation_id: str | None = None
+    target_id: str | None = None
     readback_values: dict[str, Any] = Field(default_factory=dict)
+    conflict: dict[str, Any] | None = None
     error: str | None = None
 
 
 class DeliveryReceipt(ContractModel):
     target: str
+    receipt_id: str = ""
+    plan_id: str = ""
+    status: Literal["complete", "partial", "rolled_back"] = "complete"
+    source_root: str | None = None
+    output_root: str | None = None
     outcomes: list[DeliveryOutcome] = Field(default_factory=list)
     backups: list[str] = Field(default_factory=list)
     rollback_data: dict[str, Any] = Field(default_factory=dict)
