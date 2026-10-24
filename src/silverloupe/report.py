@@ -67,6 +67,41 @@ def _read_jsonl(path: Path, model: type[ModelT]) -> list[ModelT]:
     return result
 
 
+def _generation_status(output: Path, name: str) -> str | None:
+    path = output / name
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError(f"invalid {name}: {error}") from error
+    if not isinstance(value, dict) or not isinstance(value.get("status"), str):
+        raise ValueError(f"invalid {name}: missing status")
+    return str(value["status"])
+
+
+def _validate_snapshot(state: RunState, output: Path, session: SessionConfig) -> None:
+    persisted = _read_json(output / "run-state.json", RunState)
+    if persisted != state:
+        raise ValueError("run state is stale; reload it before building the report")
+    if Path(persisted.output_root).expanduser().resolve() != output:
+        raise ValueError("run-state output_root does not match the report output directory")
+    if session.session_id != state.session_id:
+        raise ValueError("run state does not match the active session")
+    if session.revision != state.revision:
+        raise ValueError("run-state revision does not match the active session revision")
+    if _generation_status(output, "assessment-generation.json") != "complete":
+        raise ValueError("assessment generation is incomplete; run assess again")
+    override_status = _generation_status(output, "override-generation.json")
+    if override_status not in {None, "complete"}:
+        raise ValueError("override generation is incomplete; resolve it before reporting")
+    if (
+        state.status == "completed"
+        and _generation_status(output, "curation-generation.json") != "complete"
+    ):
+        raise ValueError("curation generation is incomplete; run curate again")
+
+
 def _safe_preview(output: Path, asset: Asset | None) -> str | None:
     if asset is None or not asset.preview_provenance:
         return None
@@ -148,6 +183,7 @@ def _section(
 def _render(state: RunState) -> str:
     output = Path(state.output_root).resolve()
     session = _read_json(output / "session.json", SessionConfig)
+    _validate_snapshot(state, output, session)
     assets = {value.asset_id: value for value in _read_jsonl(output / "assets.jsonl", Asset)}
     items = {value.item_id: value for value in _read_array(output / "selection-items.json", SelectionItem)}
     assessments = {
@@ -156,7 +192,7 @@ def _render(state: RunState) -> str:
     decisions = {value.item_id: value for value in _read_jsonl(output / "decisions.jsonl", Decision)}
     selection = (
         _read_json(output / "selection.json", Selection)
-        if (output / "selection.json").is_file()
+        if state.status == "completed" and (output / "selection.json").is_file()
         else Selection()
     )
 
@@ -186,7 +222,14 @@ def _render(state: RunState) -> str:
         f'<p><span class="status">{escape(status_label)}</span> '
         f'Session {escape(session.session_id)}, revision {session.revision}</p>'
     )
-    if state.status == "partial":
+    if "visual_evidence_unavailable" in state.errors:
+        disclosure = (
+            '<section class="disclosure"><h2>Visual evidence unavailable</h2>'
+            '<p>The run is partial because no safe preview artifact can be sent to host vision. '
+            'Review the available inventory and decode limitations; do not treat this result as '
+            'a completed selection.</p></section>'
+        )
+    elif state.status == "partial":
         disclosure = (
             '<section class="disclosure"><h2>Visual evidence required</h2>'
             '<p>The run is partial. Review <code>vision-request.json</code> and import '
@@ -223,6 +266,7 @@ def build_report(state: RunState) -> Path:
     output = Path(state.output_root).expanduser().resolve()
     validate_output_layout(output)
     document = _render(state)
+    session = _read_json(output / "session.json", SessionConfig)
     report_dir = output / "report"
     report_dir.mkdir(parents=True, exist_ok=True)
     if report_dir.is_symlink() or not report_dir.resolve().is_relative_to(output):
@@ -235,6 +279,8 @@ def build_report(state: RunState) -> Path:
         "status": "publishing",
         "files": ["report/index.html"],
         "run_status": state.status,
+        "session_id": session.session_id,
+        "session_revision": state.revision,
     }
     marker_path = output / "report-generation.json"
     atomic_write_text(

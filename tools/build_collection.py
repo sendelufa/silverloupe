@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
 import re
 import shutil
 from pathlib import Path
@@ -117,6 +118,35 @@ def _dev_files(source_root: Path) -> dict[str, bytes]:
     return files
 
 
+def _validate_bundle_graph(
+    artifact_files: dict[str, bytes], *, kind: Literal["runtime", "dev-toolkit"]
+) -> None:
+    """Validate every shipped Markdown edge before creating the destination."""
+
+    forbidden = ("/Users/", "/home/", "\\Users\\")
+    runtime_forbidden = ("evals/", "tests/", "docs/superpowers")
+    for relative, data in artifact_files.items():
+        if not relative.endswith(".md"):
+            continue
+        document = data.decode("utf-8")
+        if any(value in document for value in forbidden):
+            raise ValueError(f"checkout-specific reference in {relative}")
+        if kind == "runtime" and any(value in document for value in runtime_forbidden):
+            raise ValueError(f"development reference in runtime document {relative}")
+        parent = posixpath.dirname(relative)
+        for link in _LINK_PATTERN.findall(document):
+            target = link.split("#", 1)[0].split("?", 1)[0]
+            if not target:
+                continue
+            if target.startswith("/") or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", target):
+                raise ValueError(f"unsupported or escaping reference {link!r} in {relative}")
+            normalized = posixpath.normpath(posixpath.join(parent, target))
+            if normalized == ".." or normalized.startswith("../"):
+                raise ValueError(f"unsupported or escaping reference {link!r} in {relative}")
+            if normalized not in artifact_files:
+                raise ValueError(f"broken bundle reference {link!r} in {relative}")
+
+
 def build_collection(
     source_root: Path,
     destination: Path,
@@ -136,6 +166,7 @@ def build_collection(
     artifact_files = (
         _runtime_files(source_root) if kind == "runtime" else _dev_files(source_root)
     )
+    _validate_bundle_graph(artifact_files, kind=kind)
     _prepare_destination(destination)
     destination = destination.resolve()
     for relative, data in sorted(artifact_files.items()):

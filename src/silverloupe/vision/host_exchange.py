@@ -31,6 +31,10 @@ _CRITERIA = [
 ]
 
 
+class NoVisionArtifactsError(ValueError):
+    """No trustworthy local artifact can be handed to host vision."""
+
+
 def _vision_policy(config: RunConfig) -> dict[str, int]:
     raw = config.budget.get("vision_policy", {})
     if not isinstance(raw, dict):
@@ -173,7 +177,9 @@ def build_vision_request(
         requested_asset_ids.append(asset.asset_id)
 
     if not artifacts:
-        raise ValueError("no safe preview artifacts are available for host vision")
+        raise NoVisionArtifactsError(
+            "no safe preview artifacts are available for host vision"
+        )
 
     input_fingerprint = _request_input_fingerprint(
         manifest, requested_asset_ids, brief, config

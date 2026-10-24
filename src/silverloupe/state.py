@@ -41,6 +41,32 @@ def atomic_write_text(path: Path, text: str) -> None:
             temporary.unlink()
 
 
+def invalidate_report_generation(output: Path, reason: str) -> None:
+    """Mark an existing report stale before any upstream artifact changes."""
+
+    marker_path = output.expanduser().resolve() / "report-generation.json"
+    if not marker_path.is_file():
+        return
+    marker: dict[str, Any] = {}
+    try:
+        loaded = json.loads(marker_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            marker = loaded
+    except (OSError, ValueError):
+        pass
+    marker.update(
+        {
+            "schema_version": 1,
+            "status": "invalidated",
+            "reason": reason,
+        }
+    )
+    atomic_write_text(
+        marker_path,
+        json.dumps(marker, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+
+
 class CheckpointStore:
     def __init__(self, output: Path) -> None:
         output.mkdir(parents=True, exist_ok=True)

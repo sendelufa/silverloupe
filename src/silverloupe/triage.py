@@ -26,7 +26,7 @@ from silverloupe.contracts import (
 )
 from silverloupe.previews import validate_output_layout
 from silverloupe.signals import measure_asset_signals
-from silverloupe.state import atomic_write_text, load_run_config
+from silverloupe.state import atomic_write_text, invalidate_report_generation, load_run_config
 from silverloupe.vision.base import VisionImportResult, VisionRequest
 from silverloupe.vision.host_exchange import (
     apply_vision_response,
@@ -337,6 +337,7 @@ def _publish_assessment_artifacts(
     decisions: list[Decision],
     report: dict[str, Any],
 ) -> None:
+    invalidate_report_generation(output, "assessment_changed")
     curation_marker = output / "curation-generation.json"
     if curation_marker.is_file():
         previous: dict[str, Any] = {}

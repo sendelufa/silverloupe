@@ -13,7 +13,6 @@ from pydantic import BaseModel, ValidationError
 from silverloupe.contracts import (
     Decision,
     DecisionAuthority,
-    DecisionStatus,
     RunConfig,
     RunState,
     SelectionItem,
@@ -25,8 +24,9 @@ from silverloupe.curation import curate_prepared
 from silverloupe.grouping import group_prepared
 from silverloupe.inventory import prepare
 from silverloupe.previews import validate_output_layout
-from silverloupe.state import atomic_write_text
+from silverloupe.state import atomic_write_text, invalidate_report_generation
 from silverloupe.triage import assess_prepared, create_vision_request_prepared
+from silverloupe.vision.host_exchange import NoVisionArtifactsError
 
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -105,6 +105,7 @@ def _artifact_paths(output: Path) -> dict[str, str]:
 def _state(output: Path, session: SessionConfig, status: str, errors: list[str]) -> RunState:
     return RunState(
         session_id=session.session_id,
+        revision=session.revision,
         status=status,
         output_root=str(output),
         artifact_paths=_artifact_paths(output),
@@ -124,13 +125,18 @@ def load_run_state(output: Path) -> RunState:
 
     output = output.expanduser().resolve()
     try:
-        return RunState.model_validate_json(
+        state = RunState.model_validate_json(
             (output / "run-state.json").read_text(encoding="utf-8")
         )
     except FileNotFoundError as error:
         raise FileNotFoundError(f"run state does not exist: {output / 'run-state.json'}") from error
     except (OSError, ValidationError) as error:
         raise ValueError(f"invalid run-state.json: {error}") from error
+    if Path(state.output_root).expanduser().resolve() != output:
+        raise ValueError(
+            "run-state output_root does not match the requested output directory"
+        )
+    return state
 
 
 def run_session(config: RunConfig) -> RunState:
@@ -149,8 +155,12 @@ def run_session(config: RunConfig) -> RunState:
     assessment = assess_prepared(output)
     session = _session(output)
     if assessment["status"] != "completed":
-        create_vision_request_prepared(output)
-        state = _state(output, session, "partial", ["visual_evidence_required"])
+        try:
+            create_vision_request_prepared(output)
+            errors = ["visual_evidence_required"]
+        except NoVisionArtifactsError:
+            errors = ["visual_evidence_unavailable"]
+        state = _state(output, session, "partial", errors)
         _write_run_state(output, state)
         return load_run_state(output)
     curate_prepared(output)
@@ -174,7 +184,6 @@ def _override_decision(decision: Decision, override: SelectionOverride) -> Decis
     }[tier]
     return decision.model_copy(
         update={
-            "status": DecisionStatus.KEEP,
             "tier": tier,
             "rating_proposal": rating,
             "reason_codes": list(dict.fromkeys([*decision.reason_codes, "user_override"])),
@@ -213,11 +222,36 @@ def _validate_overrides(
         )
 
 
+def _generation_status(output: Path, name: str) -> str | None:
+    path = output / name
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError(f"invalid {name}: {error}") from error
+    if not isinstance(value, dict) or not isinstance(value.get("status"), str):
+        raise ValueError(f"invalid {name}: missing status")
+    return str(value["status"])
+
+
+def _require_completed_run(output: Path) -> None:
+    state = load_run_state(output)
+    if state.status != "completed":
+        raise ValueError("selection overrides require a completed run")
+    if _generation_status(output, "curation-generation.json") != "complete":
+        raise ValueError("selection overrides require a complete curation generation")
+    override_status = _generation_status(output, "override-generation.json")
+    if override_status not in {None, "complete"}:
+        raise ValueError("override generation is incomplete; resolve it before applying changes")
+
+
 def apply_overrides(output: Path, overrides: list[SelectionOverride]) -> RunState:
     """Validate all user corrections, publish them, and rerun curation."""
 
     output = output.expanduser().resolve()
     validate_output_layout(output)
+    _require_completed_run(output)
     session = _session(output)
     items = _read_json_array(output / "selection-items.json", SelectionItem)
     _validate_overrides(session, items, overrides)
@@ -252,6 +286,7 @@ def apply_overrides(output: Path, overrides: list[SelectionOverride]) -> RunStat
             "run-state.json",
         ],
     }
+    invalidate_report_generation(output, "override_changed")
     atomic_write_text(
         marker_path,
         json.dumps(marker, ensure_ascii=False, indent=2, sort_keys=True) + "\n",

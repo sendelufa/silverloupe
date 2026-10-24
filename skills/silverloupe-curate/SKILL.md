@@ -20,7 +20,9 @@ The runtime dependency is `silverloupe==0.1.0`.
 1. Confirm `assessment-generation.json` is complete.
 2. Confirm every selection item has current technical and visual evidence or remains explicitly unassessed.
 3. Read the brief's genres, `top_k`, coverage checklist, repetition limits, and preselected items.
-4. Stop when visual evidence is partial or the requested genre is unsupported.
+4. Stop when visual evidence is partial. When a requested genre has no bundled profile,
+   continue with generic uncalibrated scoring and disclose that no genre-specific profile
+   contributed weights.
 
 Why: editorial ranking cannot honestly complete when its evidence generation is incomplete.
 
@@ -35,6 +37,9 @@ Load only the requested genre guide:
 - If the brief includes landscape, read [landscape editorial guide](../../resources/genres/landscape.md) completely.
 
 Do not load an unrequested genre guide. Why: irrelevant priorities can distort evidence and violate disclosure expectations.
+
+If none of the requested genres has a bundled guide, load no genre guide. The runtime's
+generic criteria remain available, but the result must not claim genre-specific calibration.
 
 ## Validate the brief
 
@@ -91,6 +96,7 @@ Inspect:
 - [ ] repetition limits are applied or disclosed as unmet;
 - [ ] requested coverage is satisfied or explicitly missing;
 - [ ] reasons retain winners and acceptable alternatives;
+- [ ] unprofiled genres use the disclosed generic fallback rather than a fabricated profile;
 - [ ] photo-eval metrics remain unavailable unless separately measured.
 
 ## Stop conditions

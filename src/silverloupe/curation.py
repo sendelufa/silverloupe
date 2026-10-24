@@ -27,7 +27,7 @@ from silverloupe.contracts import (
     SelectionTier,
 )
 from silverloupe.previews import validate_output_layout
-from silverloupe.state import atomic_write_text, load_run_config
+from silverloupe.state import atomic_write_text, invalidate_report_generation, load_run_config
 
 
 _COMPETITIVE_GROUP_TYPES = {"burst", "near_duplicate"}
@@ -952,6 +952,7 @@ def _publish_curation_artifacts(
     selection: Selection,
     report: dict[str, Any],
 ) -> None:
+    invalidate_report_generation(output, "curation_changed")
     artifacts = {
         output / "decisions.jsonl": _jsonl(decisions),
         output / "selection.json": selection.model_dump_json(indent=2) + "\n",

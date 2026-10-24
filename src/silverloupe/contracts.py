@@ -206,6 +206,7 @@ class RunConfig(ContractModel):
 
 class RunState(ContractModel):
     session_id: str
+    revision: int = Field(ge=1)
     status: Literal["completed", "partial", "failed"]
     output_root: str
     artifact_paths: dict[str, str] = Field(default_factory=dict)

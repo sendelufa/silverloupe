@@ -35,7 +35,7 @@ Unknown fields are invalid. Do not infer people, relationships, events, location
 
 ## Run state
 
-`run-state.json` contains the session ID, `completed|partial|failed` status, output root, output-relative artifact paths, and disclosure errors. Treat `partial` as an explicit stopping condition.
+`run-state.json` contains the session ID and revision, `completed|partial|failed` status, output root, output-relative artifact paths, and disclosure errors. Treat `partial` as an explicit stopping condition.
 
 The core artifacts are:
 

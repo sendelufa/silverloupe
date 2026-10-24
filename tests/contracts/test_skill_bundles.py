@@ -151,6 +151,13 @@ def test_eval_skill_is_dev_only_and_does_not_trigger_for_ordinary_selection() ->
     assert 80 <= len(document.splitlines()) <= 250
 
 
+def test_curate_skill_uses_generic_fallback_for_unprofiled_genres() -> None:
+    document = (ROOT / "skills/silverloupe-curate/SKILL.md").read_text(encoding="utf-8")
+
+    assert "generic uncalibrated scoring" in document
+    assert "requested genre is unsupported" not in document
+
+
 def test_runtime_and_dev_bundles_are_closed_and_separate(tmp_path: Path) -> None:
     runtime = tmp_path / "runtime"
     dev = tmp_path / "dev-toolkit"
@@ -212,6 +219,32 @@ def test_bundle_builder_rejects_nonempty_destination_traversal_and_symlink_sourc
     skill.write_text(skill.read_text() + "\n[escape](../../../outside.md)\n", encoding="utf-8")
     with pytest.raises(ValueError, match="reference"):
         build_collection(malicious, tmp_path / "traversal-output", kind="runtime")
+
+
+@pytest.mark.parametrize(
+    "nested_link",
+    [
+        "[broken](../../docs/superpowers/missing.md)",
+        "[checkout leak](/Users/example/project/evals/private.md)",
+    ],
+)
+def test_bundle_builder_validates_nested_markdown_references(
+    tmp_path: Path, nested_link: str
+) -> None:
+    copied = tmp_path / "source"
+    shutil.copytree(ROOT / "skills", copied / "skills")
+    shutil.copytree(ROOT / "resources", copied / "resources")
+    contracts = copied / "resources/contracts.md"
+    contracts.write_text(
+        contracts.read_text(encoding="utf-8") + f"\n{nested_link}\n",
+        encoding="utf-8",
+    )
+    destination = tmp_path / "runtime"
+
+    with pytest.raises(ValueError, match="reference|checkout-specific|development"):
+        build_collection(copied, destination, kind="runtime")
+
+    assert not destination.exists()
 
 
 def test_issue6_documentation_and_two_host_smoke_are_versioned() -> None:

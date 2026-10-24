@@ -22,7 +22,13 @@ from silverloupe.previews import (
     renderer_cache_key,
     validate_output_layout,
 )
-from silverloupe.state import CheckpointStore, atomic_write_text, load_run_config, write_session
+from silverloupe.state import (
+    CheckpointStore,
+    atomic_write_text,
+    invalidate_report_generation,
+    load_run_config,
+    write_session,
+)
 
 
 RASTER_EXTENSIONS = {".bmp", ".gif", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
@@ -231,6 +237,7 @@ def prepare(source: Path, output: Path, config: RunConfig) -> Manifest:
     validate_output_layout(output)
     output.mkdir(parents=True, exist_ok=True)
     validate_output_layout(output)
+    invalidate_report_generation(output, "inventory_changed")
     normalized_config = config.model_copy(update={"source_roots": [str(source)], "output_root": str(output)})
     session_id = hashlib.sha256(f"{source}\0{output}".encode("utf-8")).hexdigest()[:20]
     store = CheckpointStore(output)

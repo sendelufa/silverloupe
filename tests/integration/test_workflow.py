@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -264,6 +265,54 @@ def test_interrupted_override_generation_never_completes(
     assert marker["status"] == "publishing"
     assert json.loads((output / "session.json").read_text())["revision"] == session["revision"]
 
+    with pytest.raises(ValueError, match="override generation is incomplete"):
+        build_report(load_run_state(output))
+
+
+def test_partial_run_rejects_overrides_without_mutation(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    _image(source / "frame.jpg", (20, 40, 60))
+    state = run_session(_config(source, output))
+    session = json.loads((output / "session.json").read_text())
+    item = json.loads((output / "selection-items.json").read_text())[0]
+    override = SelectionOverride(
+        item_id=item["item_id"],
+        revision=session["revision"],
+        selection_scope="top",
+        action="include",
+        reason="manual preference",
+    )
+    before = _hashes(output)
+
+    with pytest.raises(ValueError, match="completed run"):
+        apply_overrides(output, [override])
+
+    assert state.status == "partial"
+    assert _hashes(output) == before
+
+
+@pytest.mark.parametrize("status", ["review", "unassessed", "reject"])
+def test_tier_override_preserves_existing_decision_status(status: str) -> None:
+    decision = workflow_module.Decision(
+        item_id="item-1",
+        status=status,
+        tier="select",
+        decision_authority="user" if status == "reject" else "proposal",
+    )
+    override = SelectionOverride(
+        item_id="item-1",
+        revision=1,
+        selection_scope="selects",
+        action="exclude",
+        reason="move out of selects",
+    )
+
+    updated = workflow_module._override_decision(decision, override)
+
+    assert str(updated.status) == status
+    assert str(updated.tier) == "reserve"
+
 
 def test_partial_report_discloses_missing_visual_evidence(tmp_path: Path) -> None:
     source = tmp_path / "source"
@@ -281,6 +330,27 @@ def test_partial_report_discloses_missing_visual_evidence(tmp_path: Path) -> Non
     assert "Real-photo quality metrics: unavailable" in document
     assert "<form" not in document.lower()
     assert "<script" not in document.lower()
+
+
+@pytest.mark.parametrize("fixture", ["empty", "corrupt"])
+def test_run_without_requestable_previews_publishes_useful_partial_report(
+    tmp_path: Path, fixture: str
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    if fixture == "corrupt":
+        (source / "broken.jpg").write_bytes(b"not-a-jpeg")
+
+    state = run_session(_config(source, output))
+    document = build_report(state).read_text(encoding="utf-8")
+
+    assert state.status == "partial"
+    assert state.errors == ["visual_evidence_unavailable"]
+    assert (output / "run-state.json").is_file()
+    assert not (output / "vision-request.json").exists()
+    assert "Visual evidence unavailable" in document
+    assert "Partial" in document
 
 
 def test_report_cards_keep_details_readable_in_multi_card_sections(tmp_path: Path) -> None:
@@ -309,6 +379,43 @@ def test_complete_report_shows_all_sections_and_provenance(tmp_path: Path) -> No
     assert "Coverage" in document
     assert "Constraints" in document
     assert "Real-photo quality metrics: unavailable" in document
+
+
+def test_partial_rerun_invalidates_report_and_hides_stale_selection(tmp_path: Path) -> None:
+    source, output = _completed_run(tmp_path)
+    prior_state = load_run_state(output)
+    build_report(prior_state)
+    assert json.loads((output / "report-generation.json").read_text())["status"] == "complete"
+    _image(source / "a.jpg", (200, 10, 10))
+
+    state = run_session(_config(source, output))
+
+    assert state.status == "partial"
+    assert json.loads((output / "report-generation.json").read_text())["status"] == "invalidated"
+    document = build_report(state).read_text(encoding="utf-8")
+    assert '<h2>Top</h2><div class="grid"><p class="empty">' in document
+    assert '<h2>Selects</h2><div class="grid"><p class="empty">' in document
+
+
+def test_report_rejects_session_revision_newer_than_run_state(tmp_path: Path) -> None:
+    _source, output = _completed_run(tmp_path)
+    state = load_run_state(output)
+    session_path = output / "session.json"
+    session = json.loads(session_path.read_text())
+    session["revision"] += 1
+    session_path.write_text(json.dumps(session), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="revision"):
+        build_report(state)
+
+
+def test_load_run_state_rejects_relocated_output_root(tmp_path: Path) -> None:
+    _source, output = _completed_run(tmp_path)
+    copied = tmp_path / "copied-output"
+    shutil.copytree(output, copied)
+
+    with pytest.raises(ValueError, match="output_root does not match"):
+        load_run_state(copied)
 
 
 def test_report_escapes_untrusted_text_and_uses_only_output_relative_previews(
