@@ -142,12 +142,13 @@ def test_source_skills_have_closed_conditional_references_and_no_dev_leakage() -
     assert "../../resources/artistic-intent.md" in triage
 
 
-def test_deliver_skill_references_both_adobe_adapters() -> None:
+def test_deliver_skill_references_all_editor_adapters() -> None:
     path = ROOT / "skills/silverloupe-deliver/SKILL.md"
     document = path.read_text(encoding="utf-8")
 
     assert "../../resources/adapters/lightroom.md" in document
     assert "../../resources/adapters/photoshop.md" in document
+    assert "../../resources/adapters/lightcraft.md" in document
     for link in _links(path):
         assert (path.parent / link).resolve().is_file()
 
@@ -210,6 +211,9 @@ def test_runtime_bundle_preserves_canonical_reference_bytes_and_is_deterministic
     assert (
         first / "skills/silverloupe-deliver/references/adapters/photoshop.md"
     ).read_bytes() == (ROOT / "resources/adapters/photoshop.md").read_bytes()
+    assert (
+        first / "skills/silverloupe-deliver/references/adapters/lightcraft.md"
+    ).read_bytes() == (ROOT / "resources/adapters/lightcraft.md").read_bytes()
 
 
 def test_bundle_builder_rejects_nonempty_destination_traversal_and_symlink_sources(

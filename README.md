@@ -6,7 +6,7 @@ Silverloupe — проект проверяемого ассистированн
 
 ## Текущий статус
 
-**Реализован полный recommendation workflow и безопасное транзакционное ядро доставки:** read-only подготовка, консервативная группировка, проверяемый host-vision exchange, жанровая редактура, статический отчёт, revision-bound ручные исправления и contract-tested XMP sidecar plan/apply/rollback. Совместимость конкретных версий Adobe остаётся `not-tested`, пока нет реального application round-trip.
+**Реализован полный recommendation workflow и безопасное транзакционное ядро доставки:** read-only подготовка, консервативная группировка, проверяемый host-vision exchange, жанровая редактура, статический отчёт, revision-bound ручные исправления, contract-tested XMP sidecar plan/apply/rollback и нативный host-mediated LightCraft adapter. Совместимость конкретных версий Adobe остаётся `not-tested`, пока нет реального application round-trip.
 
 | Возможность | Статус |
 |---|---|
@@ -27,7 +27,7 @@ Silverloupe — проект проверяемого ассистированн
 | Production-набор из шести скиллов и отдельный dev-toolkit | Готово |
 | XMP sidecar plan/apply/readback/rollback для proprietary RAW | Готово на contract fixtures |
 | Lightroom Classic / Photoshop / Bridge application round-trip | `not-tested`; report-only до реального probe |
-| Нативная разметка LightCraft | Запланировано в Issue #8 |
+| Нативная разметка LightCraft | Contract-tested; реальный explicit-ID round-trip подтверждён в Codex host, Claude Code ещё не проверен |
 
 Актуальные этапы и критерии готовности находятся в [плане разработки](docs/superpowers/plans/2026-10-22-silverloupe.md) и [GitHub Issues](https://github.com/sendelufa/silverloupe/issues).
 
@@ -141,6 +141,8 @@ uv run --locked silverloupe delivery-rollback /path/to/output
 Apply сверяет хеши RAW и XMP, сохраняет неизвестные XMP/develop-поля, создаёт staging, backup, journal и `delivery-receipt.json`, затем проверяет readback. Batch не притворяется атомарным: partial можно повторить. Rollback — conflict-safe и не затирает последующую правку редактора или пользователя.
 
 Для пересмотренного отбора постройте новый план с `--previous-receipt`; только принадлежащие Silverloupe значения могут быть обновлены или сняты. Proposed reject не становится reject-значением без user/validated-policy authority либо точного `--accept-reject-hash`. JPEG, TIFF, DNG и PSD не изменяются на месте и пока идут по report/copy workflow.
+
+LightCraft использует отдельный host-mediated маршрут, потому что Python-процесс не предполагает прямого доступа к MCP-инструментам агента. Хост обнаруживает `catalog.query`, `photo.rate`, `photo.flag` и `photo.label`, передаёт `plan_lightcraft(...)` явные `asset_id → photo_id` mapping/readback через transport, а затем вызывает общие `apply_delivery(plan, transport)` и `rollback_delivery(receipt, transport)`. Текущий selection LightCraft и совпадение имён файлов не используются. Цветовые labels записываются только при явном mapping; отсутствие capability остаётся `report_only`. Полный контракт и граница реальной проверки описаны в [LightCraft adapter](resources/adapters/lightcraft.md).
 
 ### Production skills и dev-toolkit
 

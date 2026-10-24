@@ -28,6 +28,7 @@ _RUNTIME_REFERENCES = {
     "../../resources/genres/landscape.md": "references/genres/landscape.md",
     "../../resources/adapters/lightroom.md": "references/adapters/lightroom.md",
     "../../resources/adapters/photoshop.md": "references/adapters/photoshop.md",
+    "../../resources/adapters/lightcraft.md": "references/adapters/lightcraft.md",
 }
 _DEV_REFERENCES = {
     "../../../evals/cases/routing.jsonl": "references/routing.jsonl",

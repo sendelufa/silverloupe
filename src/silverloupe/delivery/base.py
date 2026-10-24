@@ -355,8 +355,15 @@ def plan_delivery(
     )
 
 
-def apply_delivery(plan: DeliveryPlan) -> DeliveryReceipt:
+def apply_delivery(plan: DeliveryPlan, transport: object | None = None) -> DeliveryReceipt:
     """Apply or resume a plan, journaling every target independently."""
+
+    if plan.target == "lightcraft" and plan.backend == "native":
+        if transport is None:
+            raise ValueError("LightCraft delivery requires an explicit transport")
+        from silverloupe.delivery.lightcraft import apply_lightcraft
+
+        return apply_lightcraft(plan, transport)  # type: ignore[arg-type]
 
     if plan.status != "ready" or plan.backend != "xmp":
         raise ValueError("only a ready XMP delivery plan can be applied")
@@ -522,8 +529,18 @@ def apply_delivery(plan: DeliveryPlan) -> DeliveryReceipt:
     )
 
 
-def rollback_delivery(receipt: DeliveryReceipt) -> DeliveryReceipt:
+def rollback_delivery(
+    receipt: DeliveryReceipt,
+    transport: object | None = None,
+) -> DeliveryReceipt:
     """Restore only postimages that still match this receipt."""
+
+    if receipt.target == "lightcraft":
+        if transport is None:
+            raise ValueError("LightCraft rollback requires an explicit transport")
+        from silverloupe.delivery.lightcraft import rollback_lightcraft
+
+        return rollback_lightcraft(receipt, transport)  # type: ignore[arg-type]
 
     if receipt.source_root is None or receipt.output_root is None:
         raise ValueError("delivery receipt lacks transaction roots")

@@ -11,7 +11,7 @@ description: >
 
 ## Overview
 
-Publish the static report and, only when the user explicitly selected a supported metadata route, build/apply/roll back its delivery transaction. The generic XMP sidecar core is contract-tested; no Lightroom or Photoshop compatibility is inferred from that fact.
+Publish the static report and, only when the user explicitly selected a supported metadata route, build/apply/roll back its delivery transaction. The generic XMP sidecar core is contract-tested; no Lightroom or Photoshop compatibility is inferred from that fact. LightCraft uses a separate native, host-mediated transport.
 
 The runtime dependency is `silverloupe==0.1.0`.
 
@@ -28,7 +28,7 @@ Why: planning is non-mutating, and an unavailable or unverified editor profile c
 
 If you need report sections, artifact provenance, override behavior, or transaction contracts, read [runtime contracts](../../resources/contracts.md) completely before delivery.
 
-When the requested target is Lightroom Classic, read [the Lightroom adapter](../../resources/adapters/lightroom.md). When it is Photoshop, Bridge, or Camera Raw, read [the Photoshop adapter](../../resources/adapters/photoshop.md). Read only the relevant adapter.
+When the requested target is Lightroom Classic, read [the Lightroom adapter](../../resources/adapters/lightroom.md). When it is Photoshop, Bridge, or Camera Raw, read [the Photoshop adapter](../../resources/adapters/photoshop.md). When it is LightCraft, read [the LightCraft adapter](../../resources/adapters/lightcraft.md). Read only the relevant adapter.
 
 Do not load genre guides during report publication. The report displays the provenance already produced by curation.
 
@@ -103,6 +103,10 @@ For a revised selection, rebuild with `--previous-receipt DELIVERY_RECEIPT`. Pro
 
 Lightroom/Photoshop targets remain report-only while their adapter says `not-tested`. No fallback writer is selected silently, and installed software is not compatibility proof.
 
+For LightCraft, do not use the file-only CLI path because Python cannot import host MCP tools. Discover `catalog.query`, `photo.rate`, `photo.flag`, and `photo.label`; build an explicit transport from host results; call `plan_lightcraft(...)`; inspect its conflicts; then call `apply_delivery(plan, transport)`. Every mutation must contain explicit integer photo IDs. Read back `rating`, `flag`, and `label` by those IDs, persist the receipt, and use `rollback_delivery(receipt, transport)` for conflict-safe restoration.
+
+Do not infer LightCraft IDs from the current selection or from a file name alone. Missing capability gives `report_only`; unknown flag/label values are preserved; labels require an explicit configured mapping. A prior receipt is required to update or remove Silverloupe-owned values after the canonical selection changes.
+
 Provide the static report path as the supported deliverable.
 
 ## Completion checklist
@@ -116,6 +120,7 @@ Provide the static report path as the supported deliverable.
 - [ ] target/backend selection is explicit;
 - [ ] plan conflicts and report-only fields are visible;
 - [ ] complete/partial receipt and backup paths are recorded;
+- [ ] LightCraft operations, when selected, contain explicit IDs and verified readback;
 - [ ] unavailable compatibility evidence remains explicit.
 
 ## Stop conditions
@@ -134,3 +139,5 @@ Do not start an interactive cards or swipe server. Do not represent the static r
 - Replacing a user rating or all keywords without prior field ownership.
 - Treating contract-tested XMP merge as an Adobe application round trip.
 - Promising editor synchronization because Lightroom is installed.
+- Mapping LightCraft photos by duplicate-prone file names or the current selection.
+- Calling a LightCraft metadata route without persisting field ownership and readback.
