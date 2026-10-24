@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import importlib.util
 import io
 import json
 import os
@@ -18,6 +19,11 @@ from silverloupe.contracts import DeliveryPlan, DeliveryReceipt, InstallConfig, 
 import silverloupe.installer.lifecycle as lifecycle_module
 from silverloupe.installer.capabilities import MetadataBackend, probe_install
 from silverloupe.installer.config import configure_editor
+from silverloupe.installer.discovery import (
+    AgentInstallDiscovery,
+    EditorInstallDiscovery,
+    InstallDiscovery,
+)
 from silverloupe.installer.lifecycle import (
     install_release,
     load_installed_config,
@@ -28,6 +34,91 @@ from tools.build_collection import PRODUCTION_SKILLS, build_release
 
 
 ROOT = Path(__file__).parents[2]
+
+
+class _ScriptedWizardIO:
+    def __init__(
+        self,
+        *,
+        one: list[str] | None = None,
+        many: list[tuple[str, ...]] | None = None,
+        confirmations: list[bool] | None = None,
+    ) -> None:
+        self.one = iter(one or [])
+        self.many = iter(many or [])
+        self.confirmations = iter(confirmations or [])
+        self.questions: list[str] = []
+        self.results: list[tuple[str, list[tuple[str, str, str]]]] = []
+
+    def choose_one(
+        self,
+        title: str,
+        _explanation: str,
+        _options: Any,
+        *,
+        default: str,
+    ) -> str:
+        self.questions.append(title)
+        return next(self.one, default)
+
+    def choose_many(
+        self,
+        title: str,
+        _explanation: str,
+        _options: Any,
+        *,
+        defaults: Any,
+    ) -> tuple[str, ...]:
+        self.questions.append(title)
+        return next(self.many, tuple(defaults))
+
+    def confirm(self, title: str, _explanation: str, *, default: bool) -> bool:
+        self.questions.append(title)
+        return next(self.confirmations, default)
+
+    def show_status(self, title: str, rows: Any) -> None:
+        self.results.append((title, list(rows)))
+
+    def show_result(self, title: str, rows: Any) -> None:
+        self.results.append((title, list(rows)))
+
+
+def _guided_discovery(
+    tmp_path: Path,
+    *,
+    agents: tuple[AgentInstallDiscovery, ...],
+    editors: tuple[EditorInstallDiscovery, ...] = (),
+    existing_config: InstallConfig | None = None,
+    install_root: Path | None = None,
+) -> InstallDiscovery:
+    return InstallDiscovery(
+        system="Darwin",
+        machine="arm64",
+        agents=agents,
+        editors=editors,
+        uv_path=Path(shutil.which("uv") or sys.executable),
+        python_312_available=True,
+        free_bytes=20 * 1024**3,
+        install_root=(install_root or tmp_path / "Library/Application Support/Silverloupe").resolve(),
+        existing_config=existing_config,
+    )
+
+
+def _release_installer(tmp_path: Path, version: str = "0.1.0") -> tuple[Any, Path]:
+    artifact = build_release(ROOT, tmp_path / f"dist-{version}", version)
+    unpacked = tmp_path / f"unpacked-{version}"
+    with tarfile.open(artifact, "r:gz") as handle:
+        handle.extractall(unpacked, filter="data")
+    release = unpacked / f"silverloupe-{version}"
+    spec = importlib.util.spec_from_file_location(
+        f"silverloupe_release_installer_{version.replace('.', '_')}_{id(tmp_path)}",
+        release / "install.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    shutil.rmtree(release / "__pycache__", ignore_errors=True)
+    return module, release
 
 
 def _config(tmp_path: Path, **updates: Any) -> InstallConfig:
@@ -677,3 +768,214 @@ def test_management_cli_reports_capabilities_configures_updates_and_uninstalls(
     assert cli_main(["uninstall"]) == 0
     result = json.loads(capsys.readouterr().out)
     assert result["status"] == "uninstalled"
+
+
+def test_interactive_installer_stops_before_mutation_when_no_agent_exists(
+    tmp_path: Path,
+) -> None:
+    module, _release = _release_installer(tmp_path)
+    discovery = _guided_discovery(tmp_path, agents=())
+    io_adapter = _ScriptedWizardIO()
+
+    assert module.main([], discovery=lambda: discovery, io=io_adapter) == 2
+    assert not discovery.install_root.exists()
+    assert io_adapter.results[-1][0] == "Cannot install Silverloupe"
+    assert "Codex or Claude Code" in io_adapter.results[-1][1][0][2]
+
+
+def test_single_agent_no_editor_installs_report_only_without_extra_questions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    agent = tmp_path / "bin/codex"
+    agent.parent.mkdir()
+    agent.write_text("#!/bin/sh\n", encoding="utf-8")
+    agent.chmod(0o755)
+    module, _release = _release_installer(tmp_path)
+    discovery = _guided_discovery(
+        tmp_path,
+        agents=(AgentInstallDiscovery("codex", agent.resolve()),),
+    )
+    io_adapter = _ScriptedWizardIO(confirmations=[True])
+
+    assert module.main([], discovery=lambda: discovery, io=io_adapter) == 0
+
+    installed = load_installed_config(discovery.install_root)
+    assert installed.hosts == ["codex"]
+    assert installed.default_editor == "report-only"
+    assert io_adapter.questions == ["Install Silverloupe?"]
+
+
+def test_two_agents_and_editors_use_selected_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    codex = tmp_path / "bin/codex"
+    claude = tmp_path / "bin/claude"
+    codex.parent.mkdir()
+    for executable in (codex, claude):
+        executable.write_text("#!/bin/sh\n", encoding="utf-8")
+        executable.chmod(0o755)
+    module, _release = _release_installer(tmp_path)
+    discovery = _guided_discovery(
+        tmp_path,
+        agents=(
+            AgentInstallDiscovery("codex", codex.resolve()),
+            AgentInstallDiscovery("claude-code", claude.resolve()),
+        ),
+        editors=(
+            EditorInstallDiscovery("lightroom-classic", tmp_path / "Lightroom Classic.app"),
+            EditorInstallDiscovery("lightcraft", tmp_path / "LightCraft.app"),
+        ),
+    )
+    io_adapter = _ScriptedWizardIO(
+        many=[("codex", "claude-code")],
+        one=["lightcraft"],
+        confirmations=[True],
+    )
+
+    assert module.main([], discovery=lambda: discovery, io=io_adapter) == 0
+
+    installed = load_installed_config(discovery.install_root)
+    assert installed.hosts == ["codex", "claude-code"]
+    assert installed.default_editor == "lightcraft"
+    assert installed.integration_mode_by_editor == {"lightcraft": "native"}
+
+
+def test_agent_disappearing_before_confirmation_aborts_before_install(
+    tmp_path: Path,
+) -> None:
+    agent = tmp_path / "bin/codex"
+    agent.parent.mkdir()
+    agent.touch()
+    before = _guided_discovery(
+        tmp_path,
+        agents=(AgentInstallDiscovery("codex", agent.resolve()),),
+    )
+    after = _guided_discovery(tmp_path, agents=(), install_root=before.install_root)
+    values = iter((before, after))
+    module, _release = _release_installer(tmp_path)
+    io_adapter = _ScriptedWizardIO(confirmations=[True])
+
+    assert module.main([], discovery=lambda: next(values), io=io_adapter) == 2
+    assert not before.install_root.exists()
+    assert "no longer available" in io_adapter.results[-1][1][0][2]
+
+
+def test_default_install_root_with_spaces_and_unicode_installs_successfully(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "Дом Пользователя"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    agent = tmp_path / "bin/codex"
+    agent.parent.mkdir()
+    agent.touch()
+    install_root = home / "Library/Application Support/Silverloupe"
+    discovery = _guided_discovery(
+        tmp_path,
+        agents=(AgentInstallDiscovery("codex", agent.resolve()),),
+        install_root=install_root,
+    )
+    module, _release = _release_installer(tmp_path)
+
+    assert (
+        module.main(
+            [], discovery=lambda: discovery, io=_ScriptedWizardIO(confirmations=[True])
+        )
+        == 0
+    )
+    assert load_installed_config(install_root).install_root == str(install_root.resolve())
+
+
+def test_non_interactive_requires_all_values_and_preserves_json_stdout(
+    tmp_path: Path,
+) -> None:
+    _module, release = _release_installer(tmp_path)
+
+    missing = subprocess.run(
+        [sys.executable, str(release / "install.py"), "--non-interactive"],
+        capture_output=True,
+        text=True,
+    )
+    assert missing.returncode == 2
+    assert "--host, --editor and --install-root" in missing.stderr
+
+    install_root = tmp_path / "runtime"
+    complete = subprocess.run(
+        [
+            sys.executable,
+            str(release / "install.py"),
+            "--non-interactive",
+            "--host",
+            "codex",
+            "--editor",
+            "report-only",
+            "--mode",
+            "report-only",
+            "--install-root",
+            str(install_root),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={"HOME": str(tmp_path / "home"), "PATH": os.environ.get("PATH", "")},
+    )
+    assert json.loads(complete.stdout)["status"] == "installed"
+
+
+def test_existing_install_offers_update_reconfigure_and_uninstall(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    module, release = _release_installer(tmp_path)
+    config = _config(tmp_path)
+    install_release(release, config)
+    agent = tmp_path / "bin/codex"
+    agent.parent.mkdir()
+    agent.touch()
+    discovery = _guided_discovery(
+        tmp_path,
+        agents=(AgentInstallDiscovery("codex", agent.resolve()),),
+        existing_config=config,
+        install_root=Path(config.install_root),
+    )
+    io_adapter = _ScriptedWizardIO(one=["uninstall"], confirmations=[True])
+
+    assert module.main([], discovery=lambda: discovery, io=io_adapter) == 0
+    assert not (Path(config.install_root) / ".silverloupe/config.json").exists()
+    assert io_adapter.questions == ["Existing installation", "Uninstall Silverloupe?"]
+
+
+def test_success_runs_doctor_and_shows_first_agent_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    agent = tmp_path / "bin/codex"
+    agent.parent.mkdir()
+    agent.touch()
+    discovery = _guided_discovery(
+        tmp_path,
+        agents=(AgentInstallDiscovery("codex", agent.resolve()),),
+    )
+    module, _release = _release_installer(tmp_path)
+    io_adapter = _ScriptedWizardIO(confirmations=[True])
+
+    assert module.main([], discovery=lambda: discovery, io=io_adapter) == 0
+
+    title, rows = io_adapter.results[-1]
+    assert title == "Silverloupe is ready"
+    assert any(label == "Next step" and "Codex" in detail for label, _status, detail in rows)

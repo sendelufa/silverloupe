@@ -8,8 +8,9 @@ import hashlib
 import json
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 
 _VERSION_PATTERN = re.compile(r"^[0-9]+(?:\.[0-9A-Za-z-]+)*$")
@@ -90,19 +91,22 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-quota-gb", type=int, default=5)
     parser.add_argument("--worker-limit", type=int, default=1)
     parser.add_argument("--raw", action="store_true", help="request the optional RAW decoder")
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="fail instead of prompting when required choices are missing",
+    )
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
-    hosts = args.host
-    if not hosts:
-        hosts = [input("Host (codex/claude-code): ").strip()]
-    editor = args.editor or input("Editor: ").strip()
-    install_root = args.install_root
-    if install_root is None:
-        install_root = Path(input("Install directory: ").strip()).expanduser()
-
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    discovery: Any = None,
+    io: Any = None,
+) -> int:
+    parser = _parser()
+    args = parser.parse_args(argv)
     release_root = Path(__file__).resolve().parent
     sys.dont_write_bytecode = True
     try:
@@ -113,26 +117,73 @@ def main(argv: Sequence[str] | None = None) -> int:
     sys.path.insert(0, str(release_root / "runtime/src"))
     from silverloupe.contracts import InstallConfig
     from silverloupe.installer.capabilities import probe_install
-    from silverloupe.installer.lifecycle import install_release
-
-    config = InstallConfig(
-        hosts=hosts,
-        scope=args.scope,
-        install_root=str(install_root.resolve()),
-        enabled_editors=[editor],
-        default_editor=editor,
-        integration_mode_by_editor={editor: args.mode},
-        runtime_version=manifest["release_version"],
-        model_mode=args.model_mode,
-        model_profile={"source": "release-installer"},
-        cache_quota=args.cache_quota_gb * 1024**3,
-        worker_limit=args.worker_limit,
-        install_raw_extra=args.raw,
+    from silverloupe.installer.discovery import (
+        default_install_root,
+        discover_install_environment,
     )
-    result = install_release(release_root, config)
-    result["capabilities"] = probe_install(config)
-    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-    return 0
+    from silverloupe.installer.lifecycle import install_release
+    from silverloupe.installer.presentation import (
+        CursesWizardIO,
+        InstallerCancelled,
+    )
+    from silverloupe.installer.wizard import (
+        InstallerPrerequisiteError,
+        run_installer_wizard,
+    )
+
+    fully_specified = bool(args.host and args.editor and args.install_root)
+    if args.non_interactive and not fully_specified:
+        parser.error(
+            "--host, --editor and --install-root are required with --non-interactive"
+        )
+    if fully_specified:
+        editor = args.editor
+        assert editor is not None and args.install_root is not None
+        config = InstallConfig(
+            hosts=args.host,
+            scope=args.scope,
+            install_root=str(args.install_root.expanduser().resolve()),
+            enabled_editors=[editor],
+            default_editor=editor,
+            integration_mode_by_editor={editor: args.mode},
+            runtime_version=manifest["release_version"],
+            model_mode=args.model_mode,
+            model_profile={"source": "release-installer"},
+            cache_quota=args.cache_quota_gb * 1024**3,
+            worker_limit=args.worker_limit,
+            install_raw_extra=args.raw,
+        )
+        result = install_release(release_root, config)
+        result["capabilities"] = probe_install(config)
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    if discovery is None:
+        provider: Callable[[], Any] = lambda: discover_install_environment(
+            default_install_root(Path.home())
+        )
+    elif callable(discovery):
+        provider = discovery
+    else:
+        provider = lambda: discovery
+    adapter = io or CursesWizardIO()
+    try:
+        result = run_installer_wizard(
+            release_root,
+            manifest,
+            provider(),
+            adapter,
+            rediscover=provider,
+        )
+    except InstallerCancelled:
+        return 0
+    except InstallerPrerequisiteError as error:
+        adapter.show_result(
+            "Cannot install Silverloupe",
+            [("Prerequisite", "unavailable", str(error))],
+        )
+        return 2
+    return 0 if result.get("status") != "failed" else 1
 
 
 if __name__ == "__main__":
