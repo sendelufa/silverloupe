@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "product": "silverloupe",
+  "skills": [
+    "silverloupe",
+    "silverloupe-prepare",
+    "silverloupe-triage",
+    "silverloupe-compare",
+    "silverloupe-curate",
+    "silverloupe-deliver"
+  ],
+  "runtime_dependencies": [
+    "numpy>=2.2,<3",
+    "pillow>=11,<13",
+    "pydantic>=2.12,<3"
+  ],
+  "optional_dependencies": {
+    "raw": ["rawpy>=0.25,<1"]
+  },
+  "supported_platforms": ["macos-arm64"],
+  "supported_hosts": ["codex", "claude-code"],
+  "editors": [
+    "lightroom-classic",
+    "lightroom-cloud",
+    "photoshop-camera-raw",
+    "lightcraft",
+    "report-only"
+  ],
+  "python": ">=3.12,<3.13",
+  "bootstrap": "uv python install 3.12 && uv run --python 3.12 install.py",
+  "forbidden_paths": [
+    ".pytest_cache",
+    "__pycache__",
+    "dev",
+    "evals",
+    "gold",
+    "tests"
+  ],
+  "forbidden_dependencies": ["pytest", "jsonschema"]
+}
