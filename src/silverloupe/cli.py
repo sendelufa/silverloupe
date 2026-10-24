@@ -14,12 +14,26 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from silverloupe import __version__
-from silverloupe.contracts import SCHEMA_VERSION, Brief, RunConfig, SelectionOverride, SessionConfig
+from silverloupe.contracts import (
+    SCHEMA_VERSION,
+    Asset,
+    Brief,
+    Decision,
+    DeliveryPlan,
+    DeliveryReceipt,
+    Manifest,
+    RunConfig,
+    SelectionItem,
+    SelectionOverride,
+    SessionConfig,
+)
 from silverloupe.curation import curate_prepared
+from silverloupe.delivery import apply_delivery, plan_delivery, rollback_delivery
 from silverloupe.grouping import group_prepared
 from silverloupe.inventory import prepare, resume
+from silverloupe.previews import validate_output_layout
 from silverloupe.report import build_report
-from silverloupe.state import read_status
+from silverloupe.state import atomic_write_text, read_status
 from silverloupe.triage import (
     assess_prepared,
     create_vision_request_prepared,
@@ -116,6 +130,21 @@ def _parser() -> argparse.ArgumentParser:
     )
     overrides_parser.add_argument("output")
     overrides_parser.add_argument("overrides")
+    delivery_plan_parser = subparsers.add_parser(
+        "delivery-plan", help="build an explicit, non-mutating editor delivery plan"
+    )
+    delivery_plan_parser.add_argument("output")
+    delivery_plan_parser.add_argument("--target", required=True)
+    delivery_plan_parser.add_argument("--previous-receipt")
+    delivery_plan_parser.add_argument("--accept-reject-hash")
+    delivery_apply_parser = subparsers.add_parser(
+        "delivery-apply", help="apply or resume the persisted delivery plan"
+    )
+    delivery_apply_parser.add_argument("output")
+    delivery_rollback_parser = subparsers.add_parser(
+        "delivery-rollback", help="roll back the persisted delivery receipt"
+    )
+    delivery_rollback_parser.add_argument("output")
     return parser
 
 
@@ -143,6 +172,66 @@ def _session_revision(output: Path) -> int:
     return SessionConfig.model_validate_json(
         (output / "session.json").read_text(encoding="utf-8")
     ).revision
+
+
+def _model_file(path: Path, model: type[Any]) -> Any:
+    try:
+        return model.model_validate_json(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise FileNotFoundError(f"required artifact does not exist: {path}") from error
+    except (OSError, ValueError) as error:
+        raise ValueError(f"invalid {path.name}: {error}") from error
+
+
+def _jsonl_models(path: Path, model: type[Any]) -> list[Any]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError as error:
+        raise FileNotFoundError(f"required artifact does not exist: {path}") from error
+    result: list[Any] = []
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            result.append(model.model_validate_json(line))
+        except ValueError as error:
+            raise ValueError(f"invalid {path.name} line {line_number}: {error}") from error
+    return result
+
+
+def _json_array_models(path: Path, model: type[Any]) -> list[Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise FileNotFoundError(f"required artifact does not exist: {path}") from error
+    except (OSError, ValueError) as error:
+        raise ValueError(f"invalid {path.name}: {error}") from error
+    if not isinstance(value, list):
+        raise ValueError(f"invalid {path.name}: expected a JSON array")
+    try:
+        return [model.model_validate(item) for item in value]
+    except ValueError as error:
+        raise ValueError(f"invalid {path.name}: {error}") from error
+
+
+def _require_delivery_session(output: Path) -> tuple[SessionConfig, Manifest, list[SelectionItem], list[Decision]]:
+    validate_output_layout(output)
+    state = load_run_state(output)
+    if state.status != "completed":
+        raise ValueError("delivery planning requires a completed curation run")
+    try:
+        generation = json.loads((output / "curation-generation.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError(f"invalid curation-generation.json: {error}") from error
+    if not isinstance(generation, dict) or generation.get("status") != "complete":
+        raise ValueError("delivery planning requires a completed curation generation")
+    session = _model_file(output / "session.json", SessionConfig)
+    if len(session.source_roots) != 1:
+        raise ValueError("delivery planning currently requires exactly one source root")
+    manifest = Manifest(assets=_jsonl_models(output / "assets.jsonl", Asset))
+    items = _json_array_models(output / "selection-items.json", SelectionItem)
+    decisions = _jsonl_models(output / "decisions.jsonl", Decision)
+    return session, manifest, items, decisions
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -347,6 +436,91 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
             return 0
+        if args.command == "delivery-plan":
+            output = Path(args.output).expanduser().resolve()
+            session, manifest, items, decisions = _require_delivery_session(output)
+            previous = (
+                _model_file(Path(args.previous_receipt).expanduser().resolve(), DeliveryReceipt)
+                if args.previous_receipt
+                else None
+            )
+            plan = plan_delivery(
+                manifest,
+                items,
+                decisions,
+                args.target,
+                source_root=Path(session.source_roots[0]),
+                output_root=output,
+                previous_receipt=previous,
+                accepted_reject_hash=args.accept_reject_hash,
+            )
+            plan_path = output / "delivery-plan.json"
+            atomic_write_text(plan_path, plan.model_dump_json(indent=2) + "\n")
+            print(
+                json.dumps(
+                    {
+                        "status": plan.status,
+                        "backend": plan.backend,
+                        "changes": len(plan.proposed_changes),
+                        "conflicts": len(plan.conflicts),
+                        "plan": str(plan_path),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if args.command == "delivery-apply":
+            output = Path(args.output).expanduser().resolve()
+            validate_output_layout(output)
+            plan = _model_file(output / "delivery-plan.json", DeliveryPlan)
+            if Path(plan.output_root or "").expanduser().resolve() != output:
+                raise ValueError("delivery plan output_root does not match requested output")
+            receipt = apply_delivery(plan)
+            receipt_path = output / "delivery-receipt.json"
+            atomic_write_text(receipt_path, receipt.model_dump_json(indent=2) + "\n")
+            counts = {
+                status: sum(outcome.status == status for outcome in receipt.outcomes)
+                for status in ("applied", "skipped", "failed")
+            }
+            print(
+                json.dumps(
+                    {
+                        "status": receipt.status,
+                        **counts,
+                        "receipt": str(receipt_path),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0 if receipt.status == "complete" else 3
+        if args.command == "delivery-rollback":
+            output = Path(args.output).expanduser().resolve()
+            validate_output_layout(output)
+            receipt = _model_file(output / "delivery-receipt.json", DeliveryReceipt)
+            if Path(receipt.output_root or "").expanduser().resolve() != output:
+                raise ValueError("delivery receipt output_root does not match requested output")
+            rolled_back = rollback_delivery(receipt)
+            receipt_path = output / "delivery-rollback-receipt.json"
+            atomic_write_text(receipt_path, rolled_back.model_dump_json(indent=2) + "\n")
+            print(
+                json.dumps(
+                    {
+                        "status": rolled_back.status,
+                        "applied": sum(
+                            outcome.status == "applied" for outcome in rolled_back.outcomes
+                        ),
+                        "conflicts": sum(
+                            outcome.conflict is not None for outcome in rolled_back.outcomes
+                        ),
+                        "receipt": str(receipt_path),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0 if rolled_back.status == "rolled_back" else 3
     except (FileNotFoundError, ValueError) as error:
         print(str(error), file=sys.stderr)
         return 2

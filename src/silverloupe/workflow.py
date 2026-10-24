@@ -45,6 +45,9 @@ _RUN_ARTIFACTS = (
     "manual-overrides.jsonl",
     "override-generation.json",
     "run-state.json",
+    "delivery-plan.json",
+    "delivery-receipt.json",
+    "delivery-rollback-receipt.json",
 )
 
 

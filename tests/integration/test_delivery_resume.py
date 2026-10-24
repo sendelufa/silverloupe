@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -8,13 +9,17 @@ import pytest
 import silverloupe.delivery.base as delivery_base
 from silverloupe.contracts import (
     Asset,
+    Brief,
     Decision,
     DecisionStatus,
     Manifest,
     ProposedChange,
+    RunState,
     SelectionItem,
     SelectionTier,
+    SessionConfig,
 )
+from silverloupe.cli import main
 from silverloupe.delivery import apply_delivery, plan_delivery, rollback_delivery
 from silverloupe.delivery.xmp import merge_xmp, read_xmp
 
@@ -84,6 +89,39 @@ def _xmp_with_keywords(*keywords: str) -> bytes:
         ],
         {},
     )[0]
+
+
+def _write_completed_session(output: Path, source: Path, assets: list[Asset]) -> None:
+    output.mkdir(parents=True, exist_ok=True)
+    items = [_item(asset) for asset in assets]
+    decisions = [_decision(asset, SelectionTier.TOP) for asset in assets]
+    session = SessionConfig(
+        session_id="delivery-session",
+        source_roots=[str(source)],
+        brief=Brief(),
+        revision=1,
+    )
+    state = RunState(
+        session_id=session.session_id,
+        revision=1,
+        status="completed",
+        output_root=str(output.resolve()),
+        artifact_paths={},
+    )
+    (output / "session.json").write_text(session.model_dump_json(indent=2) + "\n")
+    (output / "assets.jsonl").write_text(
+        "".join(asset.model_dump_json() + "\n" for asset in assets)
+    )
+    (output / "selection-items.json").write_text(
+        json.dumps([item.model_dump(mode="json") for item in items]) + "\n"
+    )
+    (output / "decisions.jsonl").write_text(
+        "".join(decision.model_dump_json() + "\n" for decision in decisions)
+    )
+    (output / "curation-generation.json").write_text(
+        json.dumps({"schema_version": 1, "status": "complete"}) + "\n"
+    )
+    (output / "run-state.json").write_text(state.model_dump_json(indent=2) + "\n")
 
 
 def test_apply_skips_changed_source_and_changed_sidecar_preimages(tmp_path: Path) -> None:
@@ -247,3 +285,128 @@ def test_rollback_preserves_conflicting_state(
     else:
         assert read_xmp(sidecar)["keywords"] == ["baseline", "silverloupe:top"]
         assert rollback.outcomes[0].conflict["reason"] == "backup_missing"
+def test_delivery_cli_round_trip_supports_unicode_paths_and_repeated_apply(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "исходники с пробелом"
+    output = tmp_path / "результат с пробелом"
+    source.mkdir()
+    asset = _write_raw(source, "кадр.cr2", b"raw")
+    _write_completed_session(output, source, [asset])
+
+    assert main(["delivery-plan", str(output), "--target", "xmp-sidecar"]) == 0
+    plan_summary = json.loads(capsys.readouterr().out)
+    assert plan_summary["status"] == "ready"
+    assert Path(plan_summary["plan"]) == output / "delivery-plan.json"
+
+    assert main(["delivery-apply", str(output)]) == 0
+    first_summary = json.loads(capsys.readouterr().out)
+    assert first_summary["status"] == "complete"
+    assert read_xmp(_sidecar(source, asset))["rating"] == 5
+
+    assert main(["delivery-apply", str(output)]) == 0
+    repeated_summary = json.loads(capsys.readouterr().out)
+    assert repeated_summary["applied"] == 0
+    assert repeated_summary["skipped"] == 1
+
+    assert main(["delivery-rollback", str(output)]) == 0
+    rollback_summary = json.loads(capsys.readouterr().out)
+    assert rollback_summary["status"] == "rolled_back"
+    assert not _sidecar(source, asset).exists()
+
+
+def test_delivery_plan_cli_requires_completed_curation_and_explicit_target(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    asset = _write_raw(source, "frame.nef", b"raw")
+    _write_completed_session(output, source, [asset])
+    state = RunState.model_validate_json((output / "run-state.json").read_text())
+    (output / "run-state.json").write_text(
+        state.model_copy(update={"status": "partial"}).model_dump_json(indent=2) + "\n"
+    )
+
+    assert main(["delivery-plan", str(output), "--target", "xmp-sidecar"]) == 2
+    assert "completed" in capsys.readouterr().err
+    assert not (output / "delivery-plan.json").exists()
+
+    with pytest.raises(SystemExit):
+        main(["delivery-plan", str(output)])
+
+
+def test_delivery_cli_report_only_and_malformed_artifacts_fail_closed(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    asset = _write_raw(source, "frame.cr2", b"raw")
+    _write_completed_session(output, source, [asset])
+
+    assert main(
+        ["delivery-plan", str(output), "--target", "lightroom-classic-native"]
+    ) == 0
+    report_only = json.loads(capsys.readouterr().out)
+    assert report_only["status"] == "report_only"
+    assert report_only["conflicts"] == 1
+
+    (output / "delivery-plan.json").write_text("not-json", encoding="utf-8")
+    assert main(["delivery-apply", str(output)]) == 2
+    assert "invalid delivery-plan.json" in capsys.readouterr().err
+
+    (output / "delivery-receipt.json").write_text("not-json", encoding="utf-8")
+    assert main(["delivery-rollback", str(output)]) == 2
+    assert "invalid delivery-receipt.json" in capsys.readouterr().err
+
+
+def test_delivery_cli_returns_partial_for_changed_preimage_and_rollback_conflict(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    asset = _write_raw(source, "frame.cr2", b"raw")
+    _write_completed_session(output, source, [asset])
+    assert main(["delivery-plan", str(output), "--target", "xmp-sidecar"]) == 0
+    capsys.readouterr()
+    (source / asset.relative_path).write_bytes(b"changed")
+
+    assert main(["delivery-apply", str(output)]) == 3
+    partial = json.loads(capsys.readouterr().out)
+    assert partial["status"] == "partial"
+    assert partial["failed"] == 1
+
+    (source / asset.relative_path).write_bytes(b"raw")
+    assert main(["delivery-plan", str(output), "--target", "xmp-sidecar"]) == 0
+    capsys.readouterr()
+    assert main(["delivery-apply", str(output)]) == 0
+    capsys.readouterr()
+    _sidecar(source, asset).write_bytes(_xmp_with_keywords("external"))
+    assert main(["delivery-rollback", str(output)]) == 3
+    rollback = json.loads(capsys.readouterr().out)
+    assert rollback["status"] == "partial"
+    assert rollback["conflicts"] == 1
+
+
+def test_delivery_cli_rejects_symlinked_owned_directory(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    outside = tmp_path / "outside"
+    source.mkdir()
+    outside.mkdir()
+    asset = _write_raw(source, "frame.cr2", b"raw")
+    _write_completed_session(output, source, [asset])
+    (output / "delivery").symlink_to(outside, target_is_directory=True)
+
+    assert main(["delivery-plan", str(output), "--target", "xmp-sidecar"]) == 2
+    assert "symlink" in capsys.readouterr().err
+    assert not (outside / "delivery-plan.json").exists()
