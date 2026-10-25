@@ -1,73 +1,131 @@
-# Silverloupe
+# Установка Silverloupe
 
-Silverloupe помогает подготовить, сравнить и отобрать фотографии, а затем
-перенести подтверждённую разметку в поддерживаемый редактор.
+Silverloupe устанавливается через пошаговый мастер в Terminal. Пользователю не
+нужно вручную скачивать архив, выбирать каталог, создавать virtualenv или искать
+подходящую версию Python.
 
-## Быстрый старт
+## Одна команда
 
-Production-поставка рассчитана на macOS Apple Silicon. Установите `uv`,
-распакуйте release-архив и из его корня выполните:
+После публикации первого production-релиза команда будет такой:
+
+```bash
+curl -fsSL https://github.com/sendelufa/silverloupe/releases/latest/download/install.sh | sh
+```
+
+**Сейчас этот публичный URL ещё не активирован.** Bootstrap и TUI подготовлены и
+проверяются локально; публикация GitHub Release будет отдельным шагом.
+
+## Что сделает мастер
+
+Сначала bootstrap выполняет безопасные проверки, ничего не меняя на компьютере:
+
+1. Проверяет, что используется macOS на Apple Silicon.
+2. Ищет команды `codex` и `claude`.
+3. Если ни один агент не найден, останавливается и показывает официальные ссылки.
+4. Скачивает production-релиз и проверяет его SHA-256 до распаковки.
+5. Предлагает установить `uv` и управляемый Python 3.12, если они отсутствуют.
+
+Codex и Claude Code мастер никогда не устанавливает и не обновляет.
+
+После проверок открывается пошаговый интерфейс. Он задаёт только вопросы, которые
+действительно меняют установку:
+
+- какой агент использовать, если найдены и Codex, и Claude Code;
+- какой фоторедактор использовать, если найдены совместимые приложения;
+- подтверждение перед установкой.
+
+Каталог, cache quota, число workers, Python environment и остальные технические
+параметры выбираются автоматически. По умолчанию Silverloupe устанавливается в:
+
+```text
+~/Library/Application Support/Silverloupe
+```
+
+Codex-скиллы регистрируются в `~/.agents/skills`, Claude Code — в
+`~/.claude/skills`.
+
+## Если фоторедактора нет
+
+Это не блокирует работу. Silverloupe сможет:
+
+- подготовить фотографии и превью;
+- сравнить похожие кадры;
+- сформировать selects и top;
+- создать локальный HTML-отчёт.
+
+Перенос рейтингов, flags и labels останется выключенным. Если приложение найдено,
+но его интеграция не подтверждена runtime-проверкой, мастер также использует
+безопасный `report-only`, а не притворяется, что запись метаданных доступна.
+
+LightCraft запрашивает native-интеграцию и автоматически остаётся `report-only`,
+если выбранный агент не видит нужные MCP capabilities. Найденные Adobe-приложения
+в этом релизе записываются как выбранный редактор, но остаются `report-only` до
+реального application round-trip.
+
+## После установки
+
+Мастер сам запускает `doctor` и показывает понятный итог: готовые агенты,
+возможности редактора, RAW и ограничения. Затем откройте выбранный агент и попросите
+его использовать Silverloupe для папки с фотографиями.
+
+Команды диагностики и управления остаются доступны напрямую:
+
+```bash
+~/Library/Application\ Support/Silverloupe/bin/silverloupe doctor
+~/Library/Application\ Support/Silverloupe/bin/silverloupe configure \
+  --editor lightcraft --mode native
+~/Library/Application\ Support/Silverloupe/bin/silverloupe uninstall
+```
+
+Повторный запуск TUI обнаруживает существующую установку и предлагает обновление,
+перенастройку или безопасное удаление. Uninstall удаляет только неизменённые файлы
+из ownership manifest; пользовательские и изменённые файлы сохраняются.
+
+## Требования первой версии
+
+- macOS;
+- Apple Silicon (`arm64`);
+- установленный CLI Codex или Claude Code;
+- интерактивный Terminal;
+- около 5 ГБ свободного места для runtime и обновления.
+
+Intel Mac, Linux и Windows пока не заявлены как поддерживаемые платформы.
+
+## Automation и локальная квалификация
+
+Этот раздел нужен разработчикам и CI, а не обычному пользователю.
+
+Собрать архив, checksum и bootstrap без публикации:
+
+```bash
+uv run --locked python -c '
+from pathlib import Path
+from tools.build_collection import build_release_assets
+print(build_release_assets(Path.cwd(), Path("dist/release"), "0.1.0"))
+'
+```
+
+Запустить локально собранный bootstrap:
+
+```bash
+SILVERLOUPE_RELEASE_URL="file://$PWD/dist/release/silverloupe-0.1.0.tar.gz" \
+SILVERLOUPE_RELEASE_SHA256_URL="file://$PWD/dist/release/silverloupe-0.1.0.tar.gz.sha256" \
+sh dist/release/install.sh
+```
+
+Для полностью неинтерактивной установки из уже распакованного проверенного релиза:
 
 ```bash
 uv python install 3.12
 uv run --python 3.12 --no-project \
   --with-requirements runtime/requirements.lock \
-  python install.py --help
+  python install.py --non-interactive \
+  --host codex \
+  --editor report-only \
+  --mode report-only \
+  --install-root "$HOME/Library/Application Support/Silverloupe"
 ```
 
-Выберите хост (`codex`, `claude-code` или оба), редактор и режим интеграции.
-Режим `native` требует доступной и проверенной интеграции приложения. Режим
-`file` выбирается явно и не включается автоматически. Без доступного writer
-Silverloupe остаётся в безопасном режиме `report-only`.
-
-Codex-скиллы регистрируются в `.agents/skills`, Claude Code — в
-`.claude/skills`. При `--scope user` это каталоги домашней директории, при
-`--scope project` — каталоги внутри выбранного `install-root`.
-
-Архив содержит только шесть рабочих скиллов и production runtime. Фото-evals,
-тесты и инструменты разработчика в пользовательскую поставку не входят.
-
-## Режимы и возможности
-
-- `host-vision` использует визуальные возможности выбранного Codex/Claude-хоста
-  и не скачивает локальные веса модели.
-- `local-signals` формирует только технический partial report.
-- RAW без проверенного renderer редактора требует совместимый binary wheel
-  `rawpy`; установщик не предлагает сборку C/C++ зависимости на машине
-  фотографа. Для явно выбранного `--raw` bootstrap использует
-  `runtime/requirements-raw.lock`.
-- При недоступном MCP/native backend выбранный редактор остаётся
-  `report-only`. Переход к XMP выполняется только явным выбором `file`.
-
-Первая поддерживаемая платформа — macOS на Apple Silicon с Python 3.12.
-Целевой компьютер имеет 16 ГБ RAM; стартовый soft budget Python — 3 ГБ RSS.
-Для runtime/обновления резервируется до 5 ГБ, а рабочий кэш съёмки задаётся
-отдельной квотой. Эти значения — release-бюджеты, не обещание скорости для
-любой камеры и съёмки.
-
-## Повторная установка, обновление и удаление
-
-Повторная установка той же версии идемпотентна. Обновление сначала проверяет
-и подготавливает новую версию, затем переключает `active-version`; ошибка до
-переключения сохраняет прежнюю установку. Смена редактора применяется к новым
-сессиям и не переписывает snapshot или delivery-plan существующей сессии.
-
-Удаление читает ownership manifest и удаляет только неизменённые файлы
-Silverloupe. Чужие скиллы, фотографии, результаты и каталоги сессий остаются.
-Изменённый owned-файл также сохраняется и перечисляется в результате удаления.
-
-Установленный launcher предоставляет управление без dev-checkout:
-
-```bash
-/path/to/install-root/bin/silverloupe doctor
-/path/to/install-root/bin/silverloupe configure --editor lightroom-classic --mode file
-/path/to/install-root/bin/silverloupe update /path/to/silverloupe-VERSION.tar.gz
-/path/to/install-root/bin/silverloupe uninstall
-```
-
-`doctor` показывает выбранные host/editor/model возможности. Если конкретный
-Adobe/XMP маршрут ещё не подтверждён release-матрицей, выбранный `file` режим
-остаётся `report-only`, а не объявляется готовым writer.
-
-Публикация install-репозитория или GitHub release — отдельное release-действие:
-сборщик только создаёт проверяемый архив и не отправляет его во внешний сервис.
+Флаги `--host` можно повторить для Codex и Claude Code. Optional RAW decoder
+включается только явным `--raw`; обычный мастер не задаёт этот преждевременный
+вопрос и оставляет extra выключенным.

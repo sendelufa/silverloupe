@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import platform
+import os
 import shutil
 import subprocess
 import sys
@@ -144,12 +145,21 @@ def discover_install_environment(
     uv_path = Path(uv_value).resolve() if uv_value else None
 
     if application_roots is None:
-        application_roots = (Path("/Applications"), Path.home() / "Applications")
+        configured_roots = os.environ.get("SILVERLOUPE_APPLICATION_ROOTS")
+        if configured_roots is None:
+            application_roots = (Path("/Applications"), Path.home() / "Applications")
+        else:
+            application_roots = tuple(
+                Path(value)
+                for value in configured_roots.split(os.pathsep)
+                if value
+            )
     candidates: set[Path] = set()
     for application_root in application_roots:
         if application_root.is_dir():
             candidates.update(application_root.glob("*.app"))
-    candidates.update(Path(value) for value in spotlight())
+    if os.environ.get("SILVERLOUPE_DISABLE_SPOTLIGHT") != "1":
+        candidates.update(Path(value) for value in spotlight())
 
     by_editor: dict[InstallEditor, Path] = {}
     for candidate in sorted(candidates, key=lambda value: str(value)):

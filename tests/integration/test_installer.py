@@ -5,10 +5,13 @@ import importlib.util
 import io
 import json
 import os
+import pty
+import select
 import shutil
 import subprocess
 import sys
 import tarfile
+import time
 from typing import Any
 
 import pytest
@@ -17,6 +20,7 @@ from pydantic import ValidationError
 from silverloupe.cli import main as cli_main
 from silverloupe.contracts import DeliveryPlan, DeliveryReceipt, InstallConfig, SessionConfig
 import silverloupe.installer.lifecycle as lifecycle_module
+import silverloupe.installer.wizard as wizard_module
 from silverloupe.installer.capabilities import MetadataBackend, probe_install
 from silverloupe.installer.config import configure_editor
 from silverloupe.installer.discovery import (
@@ -30,7 +34,7 @@ from silverloupe.installer.lifecycle import (
     uninstall_release,
     update_release,
 )
-from tools.build_collection import PRODUCTION_SKILLS, build_release
+from tools.build_collection import PRODUCTION_SKILLS, build_release, build_release_assets
 
 
 ROOT = Path(__file__).parents[2]
@@ -119,6 +123,42 @@ def _release_installer(tmp_path: Path, version: str = "0.1.0") -> tuple[Any, Pat
     spec.loader.exec_module(module)
     shutil.rmtree(release / "__pycache__", ignore_errors=True)
     return module, release
+
+
+def _run_installer_pty(
+    command: list[str],
+    *,
+    env: dict[str, str],
+    answers: bytes,
+    timeout: float = 30,
+) -> tuple[int, str]:
+    pid, master = pty.fork()
+    if pid == 0:
+        os.execve(command[0], command, env)
+    output = bytearray()
+    if answers:
+        os.write(master, answers)
+    deadline = time.monotonic() + timeout
+    status: int | None = None
+    try:
+        while time.monotonic() < deadline:
+            ready, _writable, _errors = select.select([master], [], [], 0.1)
+            if ready:
+                try:
+                    output.extend(os.read(master, 65536))
+                except OSError:
+                    pass
+            finished, raw_status = os.waitpid(pid, os.WNOHANG)
+            if finished:
+                status = os.waitstatus_to_exitcode(raw_status)
+                break
+        if status is None:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+            pytest.fail(f"installer PTY timed out: {output.decode(errors='replace')}")
+    finally:
+        os.close(master)
+    return status, output.decode(errors="replace")
 
 
 def _config(tmp_path: Path, **updates: Any) -> InstallConfig:
@@ -979,3 +1019,179 @@ def test_success_runs_doctor_and_shows_first_agent_prompt(
     title, rows = io_adapter.results[-1]
     assert title == "Silverloupe is ready"
     assert any(label == "Next step" and "Codex" in detail for label, _status, detail in rows)
+
+
+def test_local_bootstrap_clean_home_install_to_human_doctor(tmp_path: Path) -> None:
+    assets = build_release_assets(ROOT, tmp_path / "dist", "0.1.0")
+    home = tmp_path / "Clean Home"
+    home.mkdir()
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    for name, target in {
+        "curl": "/usr/bin/curl",
+        "find": "/usr/bin/find",
+        "mkdir": "/bin/mkdir",
+        "mktemp": "/usr/bin/mktemp",
+        "rm": "/bin/rm",
+        "shasum": "/usr/bin/shasum",
+        "tar": "/usr/bin/tar",
+        "uname": "/usr/bin/uname",
+        "uv": shutil.which("uv"),
+    }.items():
+        assert target is not None
+        (tools / name).symlink_to(target)
+    codex = tools / "codex"
+    codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    codex.chmod(0o755)
+    env = {
+        "PATH": str(tools),
+        "HOME": str(home),
+        "TERM": "xterm-256color",
+        "SILVERLOUPE_RELEASE_URL": assets.archive.as_uri(),
+        "SILVERLOUPE_RELEASE_SHA256_URL": assets.checksum.as_uri(),
+        "SILVERLOUPE_APPLICATION_ROOTS": "",
+        "SILVERLOUPE_DISABLE_SPOTLIGHT": "1",
+    }
+
+    returncode, output = _run_installer_pty(
+        ["/bin/sh", str(assets.bootstrap)],
+        env=env,
+        answers=b"\n",
+    )
+
+    assert returncode == 0
+    install_root = home / "Library/Application Support/Silverloupe"
+    assert (install_root / ".silverloupe/active-version").read_text() == "0.1.0\n"
+    assert {
+        path.name for path in (home / ".agents/skills").iterdir() if path.is_dir()
+    } == set(PRODUCTION_SKILLS)
+    assert "Silverloupe is ready" in output
+    assert "Next step" in output
+
+
+def test_wizard_update_preserves_previous_activation_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    first = build_release(ROOT, tmp_path / "dist-1", "0.1.0")
+    second = build_release(ROOT, tmp_path / "dist-2", "0.2.0")
+    config = _config(tmp_path)
+    install_release(first, config)
+    active = Path(config.install_root) / ".silverloupe/active-version"
+    agent = tmp_path / "bin/codex"
+    agent.parent.mkdir()
+    agent.touch()
+    discovery = _guided_discovery(
+        tmp_path,
+        agents=(AgentInstallDiscovery("codex", agent),),
+        existing_config=config,
+        install_root=Path(config.install_root),
+    )
+    io_adapter = _ScriptedWizardIO(one=["update"], confirmations=[True])
+    real_update = lifecycle_module.update_release
+
+    def failing_update(artifact: Path, updated: InstallConfig) -> dict[str, Any]:
+        return real_update(artifact, updated, failpoint="after_stage")
+
+    monkeypatch.setattr(wizard_module, "update_release", failing_update)
+
+    with pytest.raises(RuntimeError, match="after_stage"):
+        wizard_module.run_installer_wizard(
+            second,
+            {"release_version": "0.2.0"},
+            discovery,
+            io_adapter,
+            rediscover=lambda: discovery,
+        )
+
+    assert active.read_text(encoding="utf-8") == "0.1.0\n"
+    assert load_installed_config(Path(config.install_root)).runtime_version == "0.1.0"
+
+
+def test_wizard_uninstall_preserves_modified_and_foreign_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    artifact = build_release(ROOT, tmp_path / "dist", "0.1.0")
+    config = _config(tmp_path)
+    install_release(artifact, config)
+    skill = home / ".agents/skills/silverloupe/SKILL.md"
+    skill.write_text(skill.read_text(encoding="utf-8") + "\nuser note\n", encoding="utf-8")
+    foreign = skill.parent / "foreign.txt"
+    foreign.write_text("keep me\n", encoding="utf-8")
+    agent = tmp_path / "bin/codex"
+    agent.parent.mkdir()
+    agent.touch()
+    discovery = _guided_discovery(
+        tmp_path,
+        agents=(AgentInstallDiscovery("codex", agent),),
+        existing_config=config,
+        install_root=Path(config.install_root),
+    )
+    io_adapter = _ScriptedWizardIO(one=["uninstall"], confirmations=[True])
+
+    result = wizard_module.run_installer_wizard(
+        artifact,
+        {"release_version": "0.1.0"},
+        discovery,
+        io_adapter,
+        rediscover=lambda: discovery,
+    )
+
+    assert result["status"] == "uninstalled"
+    assert skill.is_file()
+    assert foreign.read_text(encoding="utf-8") == "keep me\n"
+    assert str(skill) in result["preserved"]
+
+
+def test_reconfigure_changes_only_new_session_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    artifact = build_release(ROOT, tmp_path / "dist", "0.1.0")
+    config = _config(tmp_path)
+    install_release(artifact, config)
+    monkeypatch.setenv("SILVERLOUPE_INSTALL_ROOT", config.install_root)
+    source = ROOT / "evals/fixtures/files"
+    old_output = tmp_path / "old-session"
+    new_output = tmp_path / "new-session"
+    assert cli_main(["prepare", str(source), str(old_output)]) == 0
+
+    agent = tmp_path / "bin/codex"
+    agent.parent.mkdir()
+    agent.touch()
+    discovery = _guided_discovery(
+        tmp_path,
+        agents=(AgentInstallDiscovery("codex", agent),),
+        editors=(EditorInstallDiscovery("lightcraft", tmp_path / "LightCraft.app"),),
+        existing_config=config,
+        install_root=Path(config.install_root),
+    )
+    io_adapter = _ScriptedWizardIO(
+        one=["reconfigure", "lightcraft"], confirmations=[True]
+    )
+
+    result = wizard_module.run_installer_wizard(
+        artifact,
+        {"release_version": "0.1.0"},
+        discovery,
+        io_adapter,
+        rediscover=lambda: discovery,
+    )
+    assert result["status"] == "updated"
+    assert cli_main(["prepare", str(source), str(new_output)]) == 0
+
+    old_session = SessionConfig.model_validate_json((old_output / "session.json").read_text())
+    new_session = SessionConfig.model_validate_json((new_output / "session.json").read_text())
+    assert old_session.editor_config_snapshot["default_editor"] == "report-only"
+    assert new_session.editor_config_snapshot["default_editor"] == "lightcraft"
+    assert new_session.editor_config_snapshot["integration_mode"] == "native"

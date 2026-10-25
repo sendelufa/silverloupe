@@ -150,6 +150,26 @@ def test_discovery_marks_existing_install_only_for_valid_config(tmp_path: Path) 
     assert invalid.diagnostics == ("existing Silverloupe configuration is invalid",)
 
 
+def test_discovery_environment_can_disable_application_search_for_qualified_smoke(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SILVERLOUPE_APPLICATION_ROOTS", "")
+    monkeypatch.setenv("SILVERLOUPE_DISABLE_SPOTLIGHT", "1")
+
+    discovery = discover_install_environment(
+        tmp_path / "install",
+        system="Darwin",
+        machine="arm64",
+        which=lambda _name: None,
+        disk_usage=_disk_usage,
+        python_312_probe=lambda: False,
+        spotlight=lambda: (_ for _ in ()).throw(AssertionError("Spotlight must be disabled")),
+    )
+
+    assert discovery.editors == ()
+
+
 def _discovery(
     tmp_path: Path,
     *,

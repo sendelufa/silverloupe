@@ -1,6 +1,7 @@
 # Silverloupe
 
-Инструкция по production-архиву и безопасной установке: [docs/user-installation.md](docs/user-installation.md).
+Дружелюбный пошаговый установщик для macOS Apple Silicon и статус публикации:
+[docs/user-installation.md](docs/user-installation.md).
 
 > Every frame deserves a closer look.
 

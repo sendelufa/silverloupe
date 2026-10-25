@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -42,6 +43,13 @@ _DEV_REFERENCES = {
 
 _VERSION_PATTERN = re.compile(r"^[0-9]+(?:\.[0-9A-Za-z-]+)*$")
 _REQUIREMENTS_CACHE: dict[tuple[str, str, bool], bytes] = {}
+
+
+@dataclass(frozen=True)
+class ReleaseAssets:
+    archive: Path
+    checksum: Path
+    bootstrap: Path
 
 
 def _safe_source(path: Path, root: Path) -> Path:
@@ -385,6 +393,68 @@ def build_release(source: Path, output: Path, version: str) -> Path:
         if temporary is not None and temporary.exists():
             temporary.unlink()
     return destination
+
+
+def _atomic_asset(path: Path, data: bytes, *, mode: int) -> None:
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(data)
+            handle.flush()
+        temporary.chmod(mode)
+        temporary.replace(path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+
+
+def build_release_assets(source: Path, output: Path, version: str) -> ReleaseAssets:
+    """Build deterministic local assets for a future hosted installer release."""
+
+    if not _VERSION_PATTERN.fullmatch(version):
+        raise ValueError("version must be a non-empty dot-separated release identifier")
+    if source.is_symlink():
+        raise ValueError("release source must not be a symlink")
+    source = source.expanduser().resolve()
+    output = output.expanduser()
+    if output.is_symlink():
+        raise ValueError("release output must not be a symlink")
+    output.mkdir(parents=True, exist_ok=True)
+    output = output.resolve()
+
+    archive = output / f"silverloupe-{version}.tar.gz"
+    checksum = output / f"{archive.name}.sha256"
+    bootstrap = output / "install.sh"
+    occupied = [path for path in (archive, checksum, bootstrap) if path.exists()]
+    if occupied:
+        raise FileExistsError(f"release asset already exists: {occupied[0]}")
+
+    bootstrap_source = _safe_source(source / "packaging/install.sh", source)
+    created: list[Path] = []
+    try:
+        archive = build_release(source, output, version)
+        created.append(archive)
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        _atomic_asset(
+            checksum,
+            f"{digest}  {archive.name}\n".encode("utf-8"),
+            mode=0o644,
+        )
+        created.append(checksum)
+        _atomic_asset(bootstrap, bootstrap_source.read_bytes(), mode=0o755)
+        created.append(bootstrap)
+    except Exception:
+        for path in reversed(created):
+            if path.exists():
+                path.unlink()
+        raise
+    return ReleaseAssets(archive=archive, checksum=checksum, bootstrap=bootstrap)
 
 
 def _main() -> int:

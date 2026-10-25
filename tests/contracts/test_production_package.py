@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tarfile
@@ -11,7 +12,12 @@ from pathlib import Path
 
 import pytest
 
-from tools.build_collection import PRODUCTION_SKILLS, build_release
+from tools.build_collection import (
+    PRODUCTION_SKILLS,
+    ReleaseAssets,
+    build_release,
+    build_release_assets,
+)
 
 
 ROOT = Path(__file__).parents[2]
@@ -176,3 +182,63 @@ def test_bootstrap_entry_point_runs_without_importing_the_runtime(tmp_path: Path
 
     assert "--host" in completed.stdout
     assert "--editor" in completed.stdout
+
+
+def test_release_assets_include_archive_checksum_and_executable_bootstrap(
+    tmp_path: Path,
+) -> None:
+    assets = build_release_assets(ROOT, tmp_path / "dist", "0.1.0")
+
+    assert isinstance(assets, ReleaseAssets)
+    assert assets.archive.name == "silverloupe-0.1.0.tar.gz"
+    assert assets.checksum.name == "silverloupe-0.1.0.tar.gz.sha256"
+    assert assets.bootstrap.name == "install.sh"
+    assert stat.S_IMODE(assets.bootstrap.stat().st_mode) == 0o755
+    assert assets.bootstrap.read_bytes() == (ROOT / "packaging/install.sh").read_bytes()
+
+
+def test_release_checksum_uses_exact_archive_basename_and_bytes(tmp_path: Path) -> None:
+    assets = build_release_assets(ROOT, tmp_path / "dist", "0.1.0")
+
+    assert assets.checksum.read_text(encoding="utf-8") == (
+        f"{hashlib.sha256(assets.archive.read_bytes()).hexdigest()}  "
+        f"{assets.archive.name}\n"
+    )
+
+
+def test_release_assets_are_reproducible_and_preserve_existing_outputs(
+    tmp_path: Path,
+) -> None:
+    first = build_release_assets(ROOT, tmp_path / "one", "0.1.0")
+    second = build_release_assets(ROOT, tmp_path / "two", "0.1.0")
+
+    assert first.archive.read_bytes() == second.archive.read_bytes()
+    assert first.checksum.read_bytes() == second.checksum.read_bytes()
+    assert first.bootstrap.read_bytes() == second.bootstrap.read_bytes()
+    before = {
+        path: path.read_bytes()
+        for path in (first.archive, first.checksum, first.bootstrap)
+    }
+    with pytest.raises(FileExistsError):
+        build_release_assets(ROOT, tmp_path / "one", "0.1.0")
+    assert {path: path.read_bytes() for path in before} == before
+
+    occupied = tmp_path / "occupied"
+    occupied.mkdir()
+    (occupied / "install.sh").write_text("foreign", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        build_release_assets(ROOT, occupied, "0.1.0")
+    assert not (occupied / "silverloupe-0.1.0.tar.gz").exists()
+    assert (occupied / "install.sh").read_text(encoding="utf-8") == "foreign"
+
+
+def test_bootstrap_source_is_not_embedded_as_an_unverified_runtime_replacement(
+    tmp_path: Path,
+) -> None:
+    assets = build_release_assets(ROOT, tmp_path / "dist", "0.1.0")
+    release = _extract(assets.archive, tmp_path / "unpacked")
+    manifest = json.loads((release / "manifest.json").read_text(encoding="utf-8"))
+
+    assert not (release / "install.sh").exists()
+    assert "install.sh" not in manifest["ownership"]
+    assert (release / "install.py").is_file()
