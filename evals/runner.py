@@ -17,8 +17,108 @@ from silverloupe.contracts import (
     SelectionItem,
 )
 
+from evals.contracts import TrialResult
+from evals.host_adapters import SUPPORTED_HOSTS, execute_host
+
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+
+
+def _trial_prompt(case: dict[str, Any], variant: str) -> str:
+    prompt = case.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("trial case requires a non-empty prompt")
+    return (
+        f"{prompt}\n\n"
+        "This is a development evaluation. Return only one JSON object with these keys: "
+        'status (passed, partial, or failed), selected_skill (string or null), disclosures '
+        "(array of strings), reference_reads (array of paths), artifact_paths (array of paths), "
+        f"and errors (array of strings). Evaluation variant: {variant}."
+    )
+
+
+def _trial_errors(case: dict[str, Any], observation: Any) -> list[str]:
+    expected = case.get("expected", {})
+    if not isinstance(expected, dict):
+        return ["case expected contract must be an object"]
+    errors: list[str] = []
+    if "selected_skill" in expected and observation.selected_skill != expected["selected_skill"]:
+        errors.append(
+            f"selected skill mismatch: expected {expected['selected_skill']!r}, "
+            f"got {observation.selected_skill!r}"
+        )
+    required = expected.get("required_disclosures", [])
+    if not isinstance(required, list) or not all(isinstance(item, str) for item in required):
+        errors.append("required_disclosures must be an array of strings")
+    else:
+        missing = sorted(set(required) - set(observation.disclosures))
+        if missing:
+            errors.append(f"missing required disclosures: {', '.join(missing)}")
+    return errors
+
+
+def run_trial(
+    case: dict[str, Any], host: str, variant: str, output_dir: Path
+) -> TrialResult:
+    """Run one host trial in a new directory and persist immutable evidence."""
+
+    if host not in SUPPORTED_HOSTS:
+        raise ValueError(f"unsupported eval host: {host}")
+    case_id = case.get("case_id")
+    if not isinstance(case_id, str) or not case_id.strip():
+        raise ValueError("trial case requires a non-empty case_id")
+    prompt = _trial_prompt(case, variant)
+    output_dir = output_dir.expanduser()
+    if output_dir.exists():
+        raise FileExistsError(f"trial output already exists: {output_dir}")
+    output_dir.mkdir(parents=True)
+    workspace = output_dir / "workspace"
+    workspace.mkdir()
+    (output_dir / "case.json").write_text(
+        json.dumps(case, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    execution = execute_host(host, prompt, workspace)
+    transcript = output_dir / "transcript.jsonl"
+    trace = output_dir / "tool-trace.log"
+    transcript.write_text(execution.stdout, encoding="utf-8")
+    trace.write_text(execution.stderr, encoding="utf-8")
+    errors = list(execution.errors)
+    observation = execution.observation
+    if observation is not None:
+        errors.extend(_trial_errors(case, observation))
+        errors.extend(observation.errors)
+    status = "failed" if errors or observation is None else observation.status
+    result = TrialResult(
+        case_id=case_id,
+        host=host,
+        variant=variant,
+        output_dir=str(output_dir.resolve()),
+        status=status,
+        transcript_path=str(transcript.resolve()),
+        tool_trace_path=str(trace.resolve()),
+        wall_time_seconds=execution.wall_time_seconds,
+        tokens=execution.tokens,
+        cost=execution.cost,
+        versions=(
+            {"host_cli": execution.version} if execution.version is not None else {}
+        ),
+        errors=errors,
+        metadata={
+            "command": list(execution.command),
+            "exit_code": execution.exit_code,
+            **(
+                {"observation": observation.model_dump(mode="json")}
+                if observation is not None
+                else {}
+            ),
+        },
+    )
+    (output_dir / "trial-result.json").write_text(
+        result.model_dump_json(indent=2) + "\n", encoding="utf-8"
+    )
+    return result
 
 
 def _load_json(path: Path) -> Any:
