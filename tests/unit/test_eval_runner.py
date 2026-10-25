@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import io
+import tarfile
 from pathlib import Path
 
 import pytest
 
 from evals.host_adapters import build_host_command
-from evals.runner import run_trial
+from evals.runner import main, run_trial
 
 
 def _write_fake_host(path: Path, *, stdout: str, stderr: str = "", exit_code: int = 0) -> None:
@@ -214,3 +216,123 @@ def test_run_trial_rejects_unknown_host_before_creating_output(tmp_path: Path) -
         run_trial(_case(), "unknown", "b3", output)
 
     assert not output.exists()
+
+
+def test_run_trial_installs_exact_artifact_into_project_scoped_host_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "fake-codex"
+    _write_fake_host(executable, stdout=_codex_stream(_observation()))
+    monkeypatch.setenv("SILVERLOUPE_EVAL_CODEX_BIN", str(executable))
+    installer = b"""\
+from pathlib import Path
+import sys
+root = Path(sys.argv[sys.argv.index('--install-root') + 1])
+host = sys.argv[sys.argv.index('--host') + 1]
+skill_root = root / ('.agents/skills' if host == 'codex' else '.claude/skills')
+target = skill_root / 'silverloupe'
+target.mkdir(parents=True)
+(target / 'SKILL.md').write_text('exact artifact skill\\n', encoding='utf-8')
+"""
+    artifact = tmp_path / "silverloupe-1.0.0.tar.gz"
+    with tarfile.open(artifact, "w:gz") as archive:
+        member = tarfile.TarInfo("silverloupe-1.0.0/install.py")
+        member.size = len(installer)
+        member.mode = 0o755
+        archive.addfile(member, io.BytesIO(installer))
+    case = {**_case(), "artifact": str(artifact)}
+
+    result = run_trial(case, "codex", "b3", tmp_path / "trial")
+
+    skill = tmp_path / "trial/workspace/.agents/skills/silverloupe/SKILL.md"
+    assert result.status == "passed"
+    assert skill.read_text(encoding="utf-8") == "exact artifact skill\n"
+    assert result.metadata["artifact"]["path"] == str(artifact.resolve())
+    assert len(result.metadata["artifact"]["sha256"]) == 64
+
+
+def test_runner_cli_requires_artifact_for_release_suite(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = main(
+        [
+            "--suite",
+            "release",
+            "--hosts",
+            "codex",
+            "--trials",
+            "1",
+            "--output",
+            str(tmp_path / "run"),
+        ]
+    )
+
+    assert exit_code == 2
+    assert "--artifact is required" in capsys.readouterr().err
+    assert not (tmp_path / "run").exists()
+
+
+def test_runner_cli_writes_deterministic_summary_for_routing_suite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "fake-codex"
+    _write_fake_host(executable, stdout=_codex_stream(_observation()))
+    monkeypatch.setenv("SILVERLOUPE_EVAL_CODEX_BIN", str(executable))
+    cases = tmp_path / "cases.jsonl"
+    cases.write_text(json.dumps(_case()) + "\n", encoding="utf-8")
+    output = tmp_path / "run"
+
+    exit_code = main(
+        [
+            "--suite",
+            "routing",
+            "--hosts",
+            "codex",
+            "--variants",
+            "b3",
+            "--trials",
+            "1",
+            "--cases",
+            str(cases),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    assert summary["suite"] == "routing"
+    assert summary["cases"] == 1
+    assert summary["hosts"] == ["codex"]
+    assert summary["variants"] == ["b3"]
+    assert summary["trial_summary"]["statuses"] == {
+        "failed": 0,
+        "partial": 0,
+        "passed": 1,
+    }
+    assert summary["results"] == [
+        "trials/route-positive/codex/b3/1/trial-result.json"
+    ]
+
+
+def test_runner_cli_rejects_existing_output_without_overwrite(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "run"
+    output.mkdir()
+    (output / "foreign.txt").write_text("keep", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "--suite",
+            "routing",
+            "--hosts",
+            "codex",
+            "--trials",
+            "1",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 2
+    assert "output already exists" in capsys.readouterr().err
+    assert (output / "foreign.txt").read_text(encoding="utf-8") == "keep"

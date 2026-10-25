@@ -16,6 +16,7 @@ Silverloupe — проект проверяемого ассистированн
 |---|---|
 | Версионированные Pydantic-контракты (`schema_version=1`) | Готово |
 | Валидация run-артефактов и deterministic graders | Готово |
+| Release metrics, exact-artifact qualification и Codex/Claude harness | Готово; live/photo evidence ещё недоступно |
 | Проверки fake IDs, полноты учёта, top-K и reject safety | Готово |
 | `silverloupe doctor` | Готово |
 | Разрешённый mini-fixture и manifest eval-данных | Готово |
@@ -32,6 +33,10 @@ Silverloupe — проект проверяемого ассистированн
 | XMP sidecar plan/apply/readback/rollback для proprietary RAW | Готово на contract fixtures |
 | Lightroom Classic / Photoshop / Bridge application round-trip | `not-tested`; report-only до реального probe |
 | Нативная разметка LightCraft | Contract-tested; реальный explicit-ID round-trip подтверждён в Codex host, Claude Code ещё не проверен |
+
+Текущая матрица поддержки описана в
+[`docs/compatibility.md`](docs/compatibility.md), а фактическое решение по локальной
+сборке `0.1.0` — в [`docs/release-report.md`](docs/release-report.md).
 
 Актуальные этапы и критерии готовности находятся в [плане разработки](docs/superpowers/plans/2026-10-22-silverloupe.md) и [GitHub Issues](https://github.com/sendelufa/silverloupe/issues).
 

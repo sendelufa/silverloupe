@@ -192,7 +192,10 @@ def _trial_evidence(evidence_root: Path | None) -> tuple[dict[str, Any], list[st
             "live release trial evidence is unavailable"
         ], False
     try:
-        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        document = json.loads(summary_path.read_text(encoding="utf-8"))
+        summary = document.get("trial_summary", document)
+        if not isinstance(summary, dict):
+            raise TypeError("trial summary must be an object")
         statuses = summary["statuses"]
         trials = int(summary["trials"])
         failed = int(statuses.get("failed", 0))

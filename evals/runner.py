@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
+import re
+import subprocess
+import sys
+import tarfile
 from pathlib import Path
-from typing import Any, Iterable, TypeVar
+from typing import Any, Iterable, Sequence, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
@@ -19,9 +25,13 @@ from silverloupe.contracts import (
 
 from evals.contracts import TrialResult
 from evals.host_adapters import SUPPORTED_HOSTS, execute_host
+from evals.metrics import summarize_trials
+from evals.release import qualify_release
 
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+_SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_SOURCE_ROOT = Path(__file__).parents[1]
 
 
 def _trial_prompt(case: dict[str, Any], variant: str) -> str:
@@ -57,6 +67,65 @@ def _trial_errors(case: dict[str, Any], observation: Any) -> list[str]:
     return errors
 
 
+def _prepare_artifact(artifact: Path, host: str, workspace: Path) -> dict[str, Any]:
+    artifact = artifact.expanduser().resolve(strict=True)
+    extracted_root = workspace / ".silverloupe-release"
+    extracted_root.mkdir()
+    roots: set[str] = set()
+    with tarfile.open(artifact, "r:gz") as archive:
+        for member in archive.getmembers():
+            member_path = Path(member.name)
+            if (
+                member_path.is_absolute()
+                or ".." in member_path.parts
+                or member.issym()
+                or member.islnk()
+                or not (member.isfile() or member.isdir())
+            ):
+                raise ValueError(f"unsafe release archive member: {member.name}")
+            if member_path.parts:
+                roots.add(member_path.parts[0])
+        if len(roots) != 1:
+            raise ValueError("release archive must contain exactly one root")
+        archive.extractall(extracted_root, filter="data")
+    release_root = extracted_root / next(iter(roots))
+    installer = release_root / "install.py"
+    if not installer.is_file():
+        raise ValueError("release archive does not contain install.py at its root")
+    command = [
+        sys.executable,
+        str(installer),
+        "--non-interactive",
+        "--host",
+        "codex" if host == "codex" else "claude-code",
+        "--editor",
+        "report-only",
+        "--mode",
+        "report-only",
+        "--scope",
+        "project",
+        "--install-root",
+        str(workspace),
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=workspace,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "no diagnostic"
+        raise RuntimeError(
+            f"release installer failed with exit code {completed.returncode}: {detail}"
+        )
+    return {
+        "path": str(artifact),
+        "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        "installer_command": command,
+    }
+
+
 def run_trial(
     case: dict[str, Any], host: str, variant: str, output_dir: Path
 ) -> TrialResult:
@@ -79,13 +148,28 @@ def run_trial(
         encoding="utf-8",
     )
 
-    execution = execute_host(host, prompt, workspace)
+    artifact_metadata: dict[str, Any] | None = None
+    preparation_errors: list[str] = []
+    artifact_value = case.get("artifact")
+    if artifact_value is not None:
+        if not isinstance(artifact_value, str) or not artifact_value.strip():
+            preparation_errors.append("case artifact must be a non-empty path string")
+        else:
+            try:
+                artifact_metadata = _prepare_artifact(Path(artifact_value), host, workspace)
+            except (OSError, ValueError, RuntimeError, tarfile.TarError) as error:
+                preparation_errors.append(f"could not install release artifact: {error}")
+    execution = (
+        execute_host(host, prompt, workspace)
+        if not preparation_errors
+        else None
+    )
     transcript = output_dir / "transcript.jsonl"
     trace = output_dir / "tool-trace.log"
-    transcript.write_text(execution.stdout, encoding="utf-8")
-    trace.write_text(execution.stderr, encoding="utf-8")
-    errors = list(execution.errors)
-    observation = execution.observation
+    transcript.write_text(execution.stdout if execution else "", encoding="utf-8")
+    trace.write_text(execution.stderr if execution else "", encoding="utf-8")
+    errors = [*preparation_errors, *(execution.errors if execution else ())]
+    observation = execution.observation if execution else None
     if observation is not None:
         errors.extend(_trial_errors(case, observation))
         errors.extend(observation.errors)
@@ -98,16 +182,19 @@ def run_trial(
         status=status,
         transcript_path=str(transcript.resolve()),
         tool_trace_path=str(trace.resolve()),
-        wall_time_seconds=execution.wall_time_seconds,
-        tokens=execution.tokens,
-        cost=execution.cost,
+        wall_time_seconds=execution.wall_time_seconds if execution else 0.0,
+        tokens=execution.tokens if execution else {},
+        cost=execution.cost if execution else {},
         versions=(
-            {"host_cli": execution.version} if execution.version is not None else {}
+            {"host_cli": execution.version}
+            if execution is not None and execution.version is not None
+            else {}
         ),
         errors=errors,
         metadata={
-            "command": list(execution.command),
-            "exit_code": execution.exit_code,
+            "command": list(execution.command) if execution else [],
+            "exit_code": execution.exit_code if execution else None,
+            **({"artifact": artifact_metadata} if artifact_metadata is not None else {}),
             **(
                 {"observation": observation.model_dump(mode="json")}
                 if observation is not None
@@ -119,6 +206,142 @@ def run_trial(
         result.model_dump_json(indent=2) + "\n", encoding="utf-8"
     )
     return result
+
+
+def _load_cases(path: Path) -> list[dict[str, Any]]:
+    cases: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"{path}:{line_number}: invalid JSON: {error.msg}") from error
+            if not isinstance(value, dict):
+                raise ValueError(f"{path}:{line_number}: case must be an object")
+            case_id = value.get("case_id")
+            if not isinstance(case_id, str) or not _SAFE_COMPONENT.fullmatch(case_id):
+                raise ValueError(f"{path}:{line_number}: unsafe or missing case_id")
+            if "expected" not in value:
+                value["expected"] = {
+                    "selected_skill": value.get("expected_skill"),
+                    "required_disclosures": value.get("required_disclosures", []),
+                }
+            cases.append(value)
+    if not cases:
+        raise ValueError(f"no eval cases found in {path}")
+    return cases
+
+
+def _csv(value: str, *, label: str) -> list[str]:
+    values = [item.strip() for item in value.split(",") if item.strip()]
+    if not values:
+        raise ValueError(f"{label} must contain at least one value")
+    if len(values) != len(set(values)):
+        raise ValueError(f"{label} contains duplicate values")
+    if not all(_SAFE_COMPONENT.fullmatch(item) for item in values):
+        raise ValueError(f"{label} contains an unsafe value")
+    return values
+
+
+def _cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="python -m evals.runner")
+    parser.add_argument("--suite", choices=("routing", "release"), required=True)
+    parser.add_argument("--hosts", required=True, help="comma-separated codex,claude")
+    parser.add_argument("--variants", default="b3", help="comma-separated eval variants")
+    parser.add_argument("--trials", type=int, required=True)
+    parser.add_argument("--cases", type=Path)
+    parser.add_argument("--artifact", type=Path)
+    parser.add_argument("--output", type=Path, required=True)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _cli_parser().parse_args(argv)
+    try:
+        hosts = _csv(args.hosts, label="hosts")
+        variants = _csv(args.variants, label="variants")
+        unknown_hosts = sorted(set(hosts) - set(SUPPORTED_HOSTS))
+        if unknown_hosts:
+            raise ValueError(f"unsupported hosts: {', '.join(unknown_hosts)}")
+        if args.trials < 1:
+            raise ValueError("--trials must be at least 1")
+        if args.suite == "release" and args.artifact is None:
+            raise ValueError("--artifact is required for the release suite")
+        output = args.output.expanduser()
+        if output.exists():
+            raise ValueError(f"output already exists: {output}")
+        cases_path = (
+            args.cases.expanduser()
+            if args.cases is not None
+            else _SOURCE_ROOT / "evals/cases/routing.jsonl"
+        )
+        cases = _load_cases(cases_path)
+        preflight: dict[str, Any] | None = None
+        artifact: Path | None = None
+        if args.artifact is not None:
+            artifact = args.artifact.expanduser().resolve(strict=True)
+            preflight = qualify_release(artifact, source_root=_SOURCE_ROOT)
+            if preflight["decision"] == "blocked":
+                raise ValueError("release artifact failed qualification preflight")
+    except (FileNotFoundError, OSError, ValueError) as error:
+        print(str(error), file=sys.stderr)
+        return 2
+
+    output.mkdir(parents=True)
+    results: list[TrialResult] = []
+    result_paths: list[str] = []
+    for case in cases:
+        prepared_case = dict(case)
+        if artifact is not None:
+            prepared_case["artifact"] = str(artifact)
+        for host in hosts:
+            for variant in variants:
+                for trial_number in range(1, args.trials + 1):
+                    trial_dir = (
+                        output
+                        / "trials"
+                        / prepared_case["case_id"]
+                        / host
+                        / variant
+                        / str(trial_number)
+                    )
+                    result = run_trial(prepared_case, host, variant, trial_dir)
+                    results.append(result)
+                    result_paths.append(
+                        (trial_dir / "trial-result.json").relative_to(output).as_posix()
+                    )
+    summary = {
+        "schema_version": 1,
+        "suite": args.suite,
+        "suite_scope": "routing-disclosure" if args.suite == "release" else "routing",
+        "cases": len(cases),
+        "hosts": hosts,
+        "variants": variants,
+        "trials_per_combination": args.trials,
+        "artifact": preflight["artifact"] if preflight is not None else None,
+        "trial_summary": summarize_trials(results),
+        "results": result_paths,
+    }
+    (output / "summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    if artifact is not None:
+        qualification = qualify_release(
+            artifact, source_root=_SOURCE_ROOT, evidence_root=output
+        )
+        (output / "qualification.json").write_text(
+            json.dumps(qualification, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+    return 0 if all(result.status == "passed" for result in results) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 
 
 def _load_json(path: Path) -> Any:

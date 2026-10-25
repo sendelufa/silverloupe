@@ -157,3 +157,29 @@ def test_qualify_release_marks_missing_trial_summary_unavailable(tmp_path: Path)
         "status": "unavailable",
         "reason": "summary.json was not found",
     }
+
+
+def test_qualify_release_consumes_runner_nested_trial_summary(tmp_path: Path) -> None:
+    artifact = build_release(ROOT, tmp_path / "dist", "0.1.0")
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    (evidence / "summary.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "suite": "release",
+                "trial_summary": {
+                    "trials": 2,
+                    "statuses": {"passed": 2, "partial": 0, "failed": 0},
+                    "runtime_reliability": 1.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = qualify_release(artifact, source_root=ROOT, evidence_root=evidence)
+
+    assert result["decision"] == "recommendation-only"
+    assert result["trial_evidence"]["status"] == "passed"
+    assert "release trial summary is invalid" not in result["blockers"]

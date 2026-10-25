@@ -9,7 +9,7 @@ Silverloupe устанавливается через пошаговый мас�
 После публикации первого production-релиза команда будет такой:
 
 ```bash
-curl -fsSL https://github.com/sendelufa/silverloupe/releases/latest/download/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/sendelufa/silverloupe/main/install.sh | sh
 ```
 
 **Сейчас этот публичный URL ещё не активирован.** Bootstrap и TUI подготовлены и
@@ -130,3 +130,18 @@ uv run --python 3.12 --no-project \
 Флаги `--host` можно повторить для Codex и Claude Code. Optional RAW decoder
 включается только явным `--raw`; обычный мастер не задаёт этот преждевременный
 вопрос и оставляет extra выключенным.
+
+Перед публикацией разработчик запускает release harness над точным архивом:
+
+```bash
+uv run --locked python -m evals.runner \
+  --suite release \
+  --hosts codex,claude \
+  --trials 5 \
+  --artifact dist/release/silverloupe-0.1.0.tar.gz \
+  --output runs/release-0.1.0
+```
+
+Команда расходует host/API budget и не запускается на пользовательском Mac во
+время установки. Текущие ограничения и release decision записаны в
+`docs/release-report.md`.
