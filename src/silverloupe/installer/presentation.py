@@ -172,12 +172,12 @@ class CursesWizardIO:
         if not options:
             raise ValueError("menu requires at least one option")
         screen.keypad(True)
-        index = 0
         selected = {
             option_index
             for option_index, (value, _label) in enumerate(options)
             if value in defaults
         }
+        index = min(selected) if selected else 0
         while True:
             screen.clear()
             self._safe_addstr(screen, 0, 0, f"Silverloupe — {title}")

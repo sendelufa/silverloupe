@@ -94,6 +94,7 @@ def _guided_discovery(
     editors: tuple[EditorInstallDiscovery, ...] = (),
     existing_config: InstallConfig | None = None,
     install_root: Path | None = None,
+    free_bytes: int = 20 * 1024**3,
 ) -> InstallDiscovery:
     return InstallDiscovery(
         system="Darwin",
@@ -102,7 +103,7 @@ def _guided_discovery(
         editors=editors,
         uv_path=Path(shutil.which("uv") or sys.executable),
         python_312_available=True,
-        free_bytes=20 * 1024**3,
+        free_bytes=free_bytes,
         install_root=(install_root or tmp_path / "Library/Application Support/Silverloupe").resolve(),
         existing_config=existing_config,
     )
@@ -948,6 +949,23 @@ def test_non_interactive_requires_all_values_and_preserves_json_stdout(
     assert missing.returncode == 2
     assert "--host, --editor and --install-root" in missing.stderr
 
+    partial_root = tmp_path / "partial-root"
+    partial = subprocess.run(
+        [
+            sys.executable,
+            str(release / "install.py"),
+            "--host",
+            "claude-code",
+            "--install-root",
+            str(partial_root),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert partial.returncode == 2
+    assert "must be supplied together" in partial.stderr
+    assert not partial_root.exists()
+
     install_root = tmp_path / "runtime"
     complete = subprocess.run(
         [
@@ -1027,6 +1045,8 @@ def test_local_bootstrap_clean_home_install_to_human_doctor(tmp_path: Path) -> N
     home.mkdir()
     tools = tmp_path / "tools"
     tools.mkdir()
+    actual_uv = shutil.which("uv")
+    assert actual_uv is not None
     for name, target in {
         "curl": "/usr/bin/curl",
         "find": "/usr/bin/find",
@@ -1036,19 +1056,34 @@ def test_local_bootstrap_clean_home_install_to_human_doctor(tmp_path: Path) -> N
         "shasum": "/usr/bin/shasum",
         "tar": "/usr/bin/tar",
         "uname": "/usr/bin/uname",
-        "uv": shutil.which("uv"),
     }.items():
         assert target is not None
         (tools / name).symlink_to(target)
     codex = tools / "codex"
     codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     codex.chmod(0o755)
+    uv_installer = tmp_path / "uv-installer.sh"
+    uv_installer.write_text(
+        "#!/bin/sh\n"
+        "/bin/mkdir -p \"$HOME/.local/bin\"\n"
+        f"/bin/ln -s {actual_uv!s} \"$HOME/.local/bin/uv\"\n",
+        encoding="utf-8",
+    )
+    uv_python_dir = subprocess.run(
+        [actual_uv, "python", "dir"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    uv_cache_dir = subprocess.run(
+        [actual_uv, "cache", "dir"], check=True, capture_output=True, text=True
+    ).stdout.strip()
     env = {
         "PATH": str(tools),
         "HOME": str(home),
         "TERM": "xterm-256color",
+        "UV_CACHE_DIR": uv_cache_dir,
+        "UV_PYTHON_INSTALL_DIR": uv_python_dir,
         "SILVERLOUPE_RELEASE_URL": assets.archive.as_uri(),
         "SILVERLOUPE_RELEASE_SHA256_URL": assets.checksum.as_uri(),
+        "SILVERLOUPE_UV_INSTALLER_URL": uv_installer.as_uri(),
         "SILVERLOUPE_APPLICATION_ROOTS": "",
         "SILVERLOUPE_DISABLE_SPOTLIGHT": "1",
     }
@@ -1056,7 +1091,7 @@ def test_local_bootstrap_clean_home_install_to_human_doctor(tmp_path: Path) -> N
     returncode, output = _run_installer_pty(
         ["/bin/sh", str(assets.bootstrap)],
         env=env,
-        answers=b"\n",
+        answers=b"y\n\n",
     )
 
     assert returncode == 0
@@ -1067,6 +1102,15 @@ def test_local_bootstrap_clean_home_install_to_human_doctor(tmp_path: Path) -> N
     } == set(PRODUCTION_SKILLS)
     assert "Silverloupe is ready" in output
     assert "Next step" in output
+    assert "Doctor: unavailable" not in output
+    doctor = subprocess.run(
+        [str(install_root / "bin/silverloupe"), "doctor"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert doctor.returncode == 0, doctor.stderr
+    assert json.loads(doctor.stdout)["core"]["status"] == "ready"
 
 
 def test_wizard_update_preserves_previous_activation_on_failure(
@@ -1150,7 +1194,7 @@ def test_wizard_uninstall_preserves_modified_and_foreign_files(
     assert str(skill) in result["preserved"]
 
 
-def test_reconfigure_changes_only_new_session_defaults(
+def test_low_disk_existing_install_can_still_uninstall(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1160,6 +1204,47 @@ def test_reconfigure_changes_only_new_session_defaults(
     artifact = build_release(ROOT, tmp_path / "dist", "0.1.0")
     config = _config(tmp_path)
     install_release(artifact, config)
+    agent = tmp_path / "bin/codex"
+    agent.parent.mkdir()
+    agent.touch()
+    discovery = _guided_discovery(
+        tmp_path,
+        agents=(AgentInstallDiscovery("codex", agent),),
+        existing_config=config,
+        install_root=Path(config.install_root),
+        free_bytes=1,
+    )
+
+    result = wizard_module.run_installer_wizard(
+        artifact,
+        {"release_version": "0.1.0"},
+        discovery,
+        _ScriptedWizardIO(one=["uninstall"], confirmations=[True]),
+        rediscover=lambda: discovery,
+    )
+
+    assert result["status"] == "uninstalled"
+    assert not (Path(config.install_root) / ".silverloupe/config.json").exists()
+
+
+def test_reconfigure_changes_only_new_session_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    first = build_release(ROOT, tmp_path / "dist-1", "0.1.0")
+    second = build_release(ROOT, tmp_path / "dist-2", "0.2.0")
+    config = _config(
+        tmp_path,
+        model_mode="local-signals",
+        model_profile={"profile": "keep-me"},
+        cache_quota=7 * 1024**3,
+        worker_limit=3,
+        install_raw_extra=True,
+    )
+    install_release(first, config)
     monkeypatch.setenv("SILVERLOUPE_INSTALL_ROOT", config.install_root)
     source = ROOT / "evals/fixtures/files"
     old_output = tmp_path / "old-session"
@@ -1181,13 +1266,20 @@ def test_reconfigure_changes_only_new_session_defaults(
     )
 
     result = wizard_module.run_installer_wizard(
-        artifact,
-        {"release_version": "0.1.0"},
+        second,
+        {"release_version": "0.2.0"},
         discovery,
         io_adapter,
         rediscover=lambda: discovery,
     )
     assert result["status"] == "updated"
+    reconfigured = load_installed_config(Path(config.install_root))
+    assert reconfigured.runtime_version == "0.1.0"
+    assert reconfigured.model_mode == "local-signals"
+    assert reconfigured.model_profile == {"profile": "keep-me"}
+    assert reconfigured.cache_quota == 7 * 1024**3
+    assert reconfigured.worker_limit == 3
+    assert reconfigured.install_raw_extra is True
     assert cli_main(["prepare", str(source), str(new_output)]) == 0
 
     old_session = SessionConfig.model_validate_json((old_output / "session.json").read_text())

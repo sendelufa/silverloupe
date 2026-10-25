@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 from collections.abc import Callable
@@ -132,13 +133,29 @@ def main(
     )
 
     fully_specified = bool(args.host and args.editor and args.install_root)
-    if args.non_interactive and not fully_specified:
+    partially_specified = bool(
+        args.host
+        or args.editor
+        or args.install_root
+        or args.scope != "user"
+        or args.mode != "report-only"
+        or args.model_mode != "host-vision"
+        or args.cache_quota_gb != 5
+        or args.worker_limit != 1
+        or args.raw
+    )
+    if not fully_specified and (args.non_interactive or partially_specified):
         parser.error(
-            "--host, --editor and --install-root are required with --non-interactive"
+            "--host, --editor and --install-root must be supplied together "
+            "for a non-interactive installation"
         )
     if fully_specified:
         editor = args.editor
         assert editor is not None and args.install_root is not None
+        model_profile = {"source": "release-installer"}
+        uv_executable = os.environ.get("SILVERLOUPE_UV_EXECUTABLE")
+        if uv_executable:
+            model_profile["uv_executable"] = uv_executable
         config = InstallConfig(
             hosts=args.host,
             scope=args.scope,
@@ -148,7 +165,7 @@ def main(
             integration_mode_by_editor={editor: args.mode},
             runtime_version=manifest["release_version"],
             model_mode=args.model_mode,
-            model_profile={"source": "release-installer"},
+            model_profile=model_profile,
             cache_quota=args.cache_quota_gb * 1024**3,
             worker_limit=args.worker_limit,
             install_raw_extra=args.raw,

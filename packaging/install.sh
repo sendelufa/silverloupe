@@ -156,6 +156,17 @@ if [ -z "$uv_path" ]; then
     fi
 fi
 
+case "$uv_path" in
+    /*)
+        uv_directory=${uv_path%/*}
+        PATH=$uv_directory:$PATH
+        export PATH
+        SILVERLOUPE_UV_EXECUTABLE=$uv_path
+        export SILVERLOUPE_UV_EXECUTABLE
+        ;;
+    *) stage_error "The resolved uv executable path is not absolute." ;;
+esac
+
 if ! "$uv_path" python find 3.12 >/dev/null 2>&1; then
     printf 'Python 3.12 is required and will be managed by uv.\n'
     printf 'It will remain installed if you later cancel Silverloupe.\n'

@@ -106,6 +106,12 @@ def test_ctrl_c_and_escape_restore_terminal_and_cancel(key: int) -> None:
         io.confirm("Install", "Ready to install", default=True)
 
 
+def test_curses_enter_accepts_displayed_destructive_default() -> None:
+    io = CursesWizardIO(wrapper=_wrapper(_Screen([10])))
+
+    assert io.confirm("Uninstall", "Remove Silverloupe?", default=False) is False
+
+
 def test_human_result_separates_ready_report_only_and_unavailable() -> None:
     rows = human_result_rows(
         {

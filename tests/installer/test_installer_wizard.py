@@ -283,6 +283,52 @@ def test_config_uses_fixed_user_defaults_and_raw_is_off(tmp_path: Path) -> None:
     assert config.integration_mode_by_editor == {"report-only": "report-only"}
 
 
+def test_update_and_reconfigure_preserve_unrelated_existing_settings(
+    tmp_path: Path,
+) -> None:
+    install_root = default_install_root(tmp_path / "home").resolve()
+    existing = InstallConfig(
+        hosts=["codex"],
+        install_root=str(install_root),
+        enabled_editors=["report-only"],
+        default_editor="report-only",
+        integration_mode_by_editor={"report-only": "report-only"},
+        runtime_version="0.1.0",
+        model_mode="local-signals",
+        model_profile={"profile": "custom", "uv_executable": "/custom/uv"},
+        cache_quota=9 * 1024**3,
+        worker_limit=4,
+        install_raw_extra=True,
+    )
+    discovery = InstallDiscovery(
+        system="Darwin",
+        machine="arm64",
+        agents=(AgentInstallDiscovery("codex", tmp_path / "bin/codex"),),
+        editors=(EditorInstallDiscovery("lightcraft", tmp_path / "LightCraft.app"),),
+        uv_path=tmp_path / "bin/uv",
+        python_312_available=True,
+        free_bytes=20 * 1024**3,
+        install_root=install_root,
+        existing_config=existing,
+    )
+    selection = WizardSelection(
+        action="reconfigure",
+        hosts=("codex",),
+        editor="lightcraft",
+        confirmed=True,
+    )
+
+    configured = build_install_config(discovery, selection, "0.2.0")
+
+    assert configured.runtime_version == "0.2.0"
+    assert configured.default_editor == "lightcraft"
+    assert configured.model_mode == "local-signals"
+    assert configured.model_profile == existing.model_profile
+    assert configured.cache_quota == 9 * 1024**3
+    assert configured.worker_limit == 4
+    assert configured.install_raw_extra is True
+
+
 def test_invalid_or_disappeared_selected_agent_is_rejected(tmp_path: Path) -> None:
     discovery = _discovery(
         tmp_path,

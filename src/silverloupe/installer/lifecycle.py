@@ -320,6 +320,12 @@ def _write_launcher(install_root: Path, version_root: Path, config: InstallConfi
     runtime_source = version_root / "runtime/src"
     if not requirements.is_file():
         raise ValueError(f"installed runtime lock is missing: {requirements}")
+    configured_uv = config.model_profile.get("uv_executable", "uv")
+    uv_executable = (
+        configured_uv
+        if isinstance(configured_uv, str) and configured_uv.strip()
+        else "uv"
+    )
     script = "\n".join(
         [
             "#!/bin/sh",
@@ -327,7 +333,7 @@ def _write_launcher(install_root: Path, version_root: Path, config: InstallConfi
             "export PYTHONDONTWRITEBYTECODE=1",
             f"export PYTHONPATH={shlex.quote(str(runtime_source))}",
             f"export SILVERLOUPE_INSTALL_ROOT={shlex.quote(str(install_root))}",
-            "exec uv run --python 3.12 --no-project "
+            f"exec {shlex.quote(uv_executable)} run --python 3.12 --no-project "
             f"--with-requirements {shlex.quote(str(requirements))} "
             "python -c 'from silverloupe.cli import main; raise SystemExit(main())' "
             '"$@"',

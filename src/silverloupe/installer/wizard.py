@@ -88,14 +88,42 @@ def build_install_config(
     if not selection.hosts or not set(selection.hosts).issubset(available_hosts):
         raise InstallerPrerequisiteError("selected agent is no longer available")
 
+    existing = discovery.existing_config
     available_editors = {editor.editor for editor in discovery.editors}
     if (
         selection.editor != "report-only"
         and selection.editor not in available_editors
+        and (existing is None or selection.editor != existing.default_editor)
     ):
         raise InstallerPrerequisiteError("selected editor is no longer available")
 
     mode = "native" if selection.editor == "lightcraft" else "report-only"
+    if existing is not None:
+        values = existing.model_dump(mode="json")
+        values["runtime_version"] = version
+        if selection.action == "reconfigure":
+            values.update(
+                {
+                    "hosts": list(selection.hosts),
+                    "enabled_editors": [selection.editor],
+                    "default_editor": selection.editor,
+                    "integration_mode_by_editor": {selection.editor: mode},
+                    "metadata_mapping_by_editor": (
+                        {
+                            selection.editor: existing.metadata_mapping_by_editor[
+                                selection.editor
+                            ]
+                        }
+                        if selection.editor in existing.metadata_mapping_by_editor
+                        else {}
+                    ),
+                }
+            )
+        return InstallConfig.model_validate(values)
+
+    model_profile: dict[str, object] = {"source": "guided-installer"}
+    if discovery.uv_path is not None:
+        model_profile["uv_executable"] = str(discovery.uv_path)
     return InstallConfig(
         hosts=list(selection.hosts),
         scope="user",
@@ -105,7 +133,7 @@ def build_install_config(
         integration_mode_by_editor={selection.editor: mode},
         runtime_version=version,
         model_mode="host-vision",
-        model_profile={"source": "guided-installer"},
+        model_profile=model_profile,
         cache_quota=5 * 1024**3,
         worker_limit=1,
         install_raw_extra=False,
@@ -158,9 +186,9 @@ def run_installer_wizard(
 ) -> dict[str, object]:
     """Run the minimal guided flow and delegate mutation to the safe lifecycle."""
 
-    questions_for(discovery)
     action: WizardAction = "install"
-    if discovery.existing_config is not None:
+    existing = discovery.existing_config
+    if existing is not None:
         action_value = io.choose_one(
             "Existing installation",
             "Choose what Silverloupe should do.",
@@ -190,7 +218,11 @@ def run_installer_wizard(
             )
             return result
 
-    if len(discovery.agents) == 1:
+    questions_for(discovery)
+
+    if action == "update" and existing is not None:
+        hosts = tuple(existing.hosts)
+    elif len(discovery.agents) == 1:
         hosts = (discovery.agents[0].host,)
     else:
         hosts = io.choose_many(
@@ -200,7 +232,9 @@ def run_installer_wizard(
             defaults=tuple(agent.host for agent in discovery.agents),
         )
 
-    if discovery.editors:
+    if action == "update" and existing is not None:
+        editor = existing.default_editor
+    elif discovery.editors:
         existing_editor = (
             discovery.existing_config.default_editor
             if discovery.existing_config is not None
@@ -219,8 +253,18 @@ def run_installer_wizard(
             default=default_editor,
         )
         editor: InstallEditor = editor_value  # type: ignore[assignment]
+    elif action == "reconfigure" and existing is not None:
+        editor = existing.default_editor
     else:
         editor = "report-only"
+
+    target_version = str(manifest["release_version"])
+    target_release = release_root
+    if action == "reconfigure" and existing is not None:
+        target_version = existing.runtime_version
+        target_release = (
+            Path(existing.install_root) / "versions" / existing.runtime_version
+        )
 
     selected = WizardSelection(
         action=action,
@@ -229,7 +273,7 @@ def run_installer_wizard(
         confirmed=io.confirm(
             "Install Silverloupe?",
             (
-                f"Version {manifest['release_version']} will be installed in "
+                f"Version {target_version} will be installed in "
                 f"{discovery.install_root}."
             ),
             default=True,
@@ -239,15 +283,17 @@ def run_installer_wizard(
         return {"status": "cancelled"}
 
     current = rediscover() if rediscover is not None else discovery
+    if action in {"update", "reconfigure"} and current.existing_config is None:
+        raise InstallerPrerequisiteError("existing installation is no longer available")
     config = build_install_config(
         current,
         selected,
-        str(manifest["release_version"]),
+        target_version,
     )
     if action == "install":
-        result = install_release(release_root, config)
+        result = install_release(target_release, config)
     else:
-        result = update_release(release_root, config)
+        result = update_release(target_release, config)
 
     rows = _doctor_rows(config)
     selected_agent = "Codex" if "codex" in config.hosts else "Claude Code"
