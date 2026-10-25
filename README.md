@@ -1,6 +1,7 @@
 # Silverloupe
 
-Дружелюбный пошаговый установщик для macOS Apple Silicon и статус публикации:
+Дружелюбный пошаговый установщик для macOS Apple Silicon находится в корне
+репозитория: [`install.sh`](install.sh). Статус публикации и инструкция:
 [docs/user-installation.md](docs/user-installation.md).
 
 > Every frame deserves a closer look.

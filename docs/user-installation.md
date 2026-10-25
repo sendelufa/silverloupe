@@ -13,7 +13,8 @@ curl -fsSL https://github.com/sendelufa/silverloupe/releases/latest/download/ins
 ```
 
 **Сейчас этот публичный URL ещё не активирован.** Bootstrap и TUI подготовлены и
-проверяются локально; публикация GitHub Release будет отдельным шагом.
+проверяются локально; исходный bootstrap находится в `install.sh` в корне
+репозитория. Публикация GitHub Release будет отдельным шагом.
 
 ## Что сделает мастер
 
@@ -110,7 +111,7 @@ print(build_release_assets(Path.cwd(), Path("dist/release"), "0.1.0"))
 ```bash
 SILVERLOUPE_RELEASE_URL="file://$PWD/dist/release/silverloupe-0.1.0.tar.gz" \
 SILVERLOUPE_RELEASE_SHA256_URL="file://$PWD/dist/release/silverloupe-0.1.0.tar.gz.sha256" \
-sh dist/release/install.sh
+sh ./install.sh
 ```
 
 Для полностью неинтерактивной установки из уже распакованного проверенного релиза:

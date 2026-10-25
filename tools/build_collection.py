@@ -435,7 +435,7 @@ def build_release_assets(source: Path, output: Path, version: str) -> ReleaseAss
     if occupied:
         raise FileExistsError(f"release asset already exists: {occupied[0]}")
 
-    bootstrap_source = _safe_source(source / "packaging/install.sh", source)
+    bootstrap_source = _safe_source(source / "install.sh", source)
     created: list[Path] = []
     try:
         archive = build_release(source, output, version)

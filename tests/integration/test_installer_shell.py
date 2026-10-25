@@ -13,7 +13,7 @@ import pytest
 
 
 ROOT = Path(__file__).parents[2]
-SCRIPT = ROOT / "packaging/install.sh"
+SCRIPT = ROOT / "install.sh"
 
 
 def _write_executable(path: Path, source: str) -> Path:

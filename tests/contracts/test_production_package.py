@@ -194,7 +194,7 @@ def test_release_assets_include_archive_checksum_and_executable_bootstrap(
     assert assets.checksum.name == "silverloupe-0.1.0.tar.gz.sha256"
     assert assets.bootstrap.name == "install.sh"
     assert stat.S_IMODE(assets.bootstrap.stat().st_mode) == 0o755
-    assert assets.bootstrap.read_bytes() == (ROOT / "packaging/install.sh").read_bytes()
+    assert assets.bootstrap.read_bytes() == (ROOT / "install.sh").read_bytes()
 
 
 def test_release_checksum_uses_exact_archive_basename_and_bytes(tmp_path: Path) -> None:
