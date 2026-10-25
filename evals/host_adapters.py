@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -33,7 +34,15 @@ class HostExecution:
     observation: HostObservation | None = None
     tokens: dict[str, int] = field(default_factory=dict)
     cost: dict[str, float] = field(default_factory=dict)
+    trace_visibility: str = "unavailable"
+    verified_reference_reads: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
+
+
+_SKILL_READ = re.compile(
+    r"(?:^|[\s'\"])(?:\./)?(?:\.agents|\.claude)/skills/"
+    r"(?P<skill>[A-Za-z0-9._-]+)/SKILL\.md(?:$|[\s'\"])",
+)
 
 
 def _require_host(host: str) -> None:
@@ -76,7 +85,8 @@ def build_host_command(
         "--print",
         "--no-session-persistence",
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
         "--permission-mode",
         "dontAsk",
         "--restricted",
@@ -106,9 +116,19 @@ def _observation(value: str) -> tuple[HostObservation | None, list[str]]:
         return None, [f"host did not return a valid structured observation: {error}"]
 
 
-def _parse_codex(stdout: str) -> tuple[HostObservation | None, dict[str, int], dict[str, float], list[str]]:
+def _normalized_skill_reads(value: str) -> set[str]:
+    return {
+        f"skills/{match.group('skill')}/SKILL.md"
+        for match in _SKILL_READ.finditer(value)
+    }
+
+
+def _parse_codex(
+    stdout: str,
+) -> tuple[HostObservation | None, dict[str, int], dict[str, float], set[str], list[str]]:
     final_text: str | None = None
     tokens: dict[str, int] = {}
+    reference_reads: set[str] = set()
     errors: list[str] = []
     for line_number, line in enumerate(stdout.splitlines(), start=1):
         if not line.strip():
@@ -126,6 +146,13 @@ def _parse_codex(stdout: str) -> tuple[HostObservation | None, dict[str, int], d
                 text = item.get("text")
                 if isinstance(text, str):
                     final_text = text
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "command_execution"
+                and item.get("exit_code") == 0
+                and isinstance(item.get("command"), str)
+            ):
+                reference_reads.update(_normalized_skill_reads(item["command"]))
         if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
             usage = event["usage"]
             if isinstance(usage.get("input_tokens"), int):
@@ -134,18 +161,47 @@ def _parse_codex(stdout: str) -> tuple[HostObservation | None, dict[str, int], d
                 tokens["output"] = usage["output_tokens"]
     if final_text is None:
         errors.append("host did not return a structured observation")
-        return None, tokens, {}, errors
+        return None, tokens, {}, reference_reads, errors
     observation, parse_errors = _observation(final_text)
-    return observation, tokens, {}, [*errors, *parse_errors]
+    return observation, tokens, {}, reference_reads, [*errors, *parse_errors]
 
 
-def _parse_claude(stdout: str) -> tuple[HostObservation | None, dict[str, int], dict[str, float], list[str]]:
-    try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError as error:
-        return None, {}, {}, [f"claude result is invalid JSON: {error.msg}"]
-    if not isinstance(payload, dict) or not isinstance(payload.get("result"), str):
-        return None, {}, {}, ["host did not return a structured observation"]
+def _parse_claude(
+    stdout: str,
+) -> tuple[HostObservation | None, dict[str, int], dict[str, float], set[str], list[str]]:
+    payload: dict[str, object] | None = None
+    reference_reads: set[str] = set()
+    errors: list[str] = []
+    for line_number, line in enumerate(stdout.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as error:
+            errors.append(f"claude event line {line_number} is invalid JSON: {error.msg}")
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "assistant":
+            message = event.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict) or block.get("type") != "tool_use":
+                        continue
+                    tool_input = block.get("input")
+                    file_path = (
+                        tool_input.get("file_path")
+                        if isinstance(tool_input, dict)
+                        else None
+                    )
+                    if block.get("name") == "Read" and isinstance(file_path, str):
+                        reference_reads.update(_normalized_skill_reads(file_path))
+        if event.get("type") == "result":
+            payload = event
+    if payload is None or not isinstance(payload.get("result"), str):
+        errors.append("host did not return a structured observation")
+        return None, {}, {}, reference_reads, errors
     tokens: dict[str, int] = {}
     usage = payload.get("usage")
     if isinstance(usage, dict):
@@ -157,8 +213,8 @@ def _parse_claude(stdout: str) -> tuple[HostObservation | None, dict[str, int], 
     total_cost = payload.get("total_cost_usd")
     if isinstance(total_cost, (int, float)) and not isinstance(total_cost, bool):
         cost["usd"] = float(total_cost)
-    observation, errors = _observation(payload["result"])
-    return observation, tokens, cost, errors
+    observation, parse_errors = _observation(payload["result"])
+    return observation, tokens, cost, reference_reads, [*errors, *parse_errors]
 
 
 def execute_host(host: str, prompt: str, workspace: Path) -> HostExecution:
@@ -199,11 +255,14 @@ def execute_host(host: str, prompt: str, workspace: Path) -> HostExecution:
     observation: HostObservation | None = None
     tokens: dict[str, int] = {}
     cost: dict[str, float] = {}
+    reference_reads: set[str] = set()
     if completed.returncode != 0:
         errors.append(f"{host} exited with exit code {completed.returncode}")
     else:
         parser = _parse_codex if host == "codex" else _parse_claude
-        observation, tokens, cost, parse_errors = parser(completed.stdout)
+        observation, tokens, cost, reference_reads, parse_errors = parser(
+            completed.stdout
+        )
         errors.extend(parse_errors)
     return HostExecution(
         command=command,
@@ -215,5 +274,7 @@ def execute_host(host: str, prompt: str, workspace: Path) -> HostExecution:
         observation=observation,
         tokens=tokens,
         cost=cost,
+        trace_visibility="available",
+        verified_reference_reads=tuple(sorted(reference_reads)),
         errors=tuple(errors),
     )

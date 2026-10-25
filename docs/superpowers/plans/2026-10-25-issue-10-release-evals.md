@@ -154,4 +154,3 @@
 - [ ] **Step 5: Run the full locked test suite, shell syntax checks, release build/inspection, and `git diff --check`**
 
 - [ ] **Step 6: Commit docs and final integration**
-

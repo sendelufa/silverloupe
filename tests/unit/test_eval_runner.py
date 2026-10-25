@@ -43,10 +43,24 @@ def _observation(**overrides: object) -> str:
     return json.dumps(value)
 
 
-def _codex_stream(observation: str) -> str:
-    return "\n".join(
+def _codex_stream(observation: str, *, include_reference_read: bool = True) -> str:
+    events = [json.dumps({"type": "thread.started", "thread_id": "fake"})]
+    if include_reference_read:
+        events.append(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": "cat .agents/skills/silverloupe/SKILL.md",
+                        "aggregated_output": "skill instructions",
+                        "exit_code": 0,
+                    },
+                }
+            )
+        )
+    events.extend(
         [
-            json.dumps({"type": "thread.started", "thread_id": "fake"}),
             json.dumps(
                 {
                     "type": "item.completed",
@@ -56,17 +70,38 @@ def _codex_stream(observation: str) -> str:
             json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 4}}),
         ]
     )
+    return "\n".join(events)
 
 
 def _claude_result(observation: str) -> str:
-    return json.dumps(
-        {
-            "type": "result",
-            "subtype": "success",
-            "result": observation,
-            "total_cost_usd": 0.125,
-            "usage": {"input_tokens": 12, "output_tokens": 5},
-        }
+    return "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Read",
+                                "input": {
+                                    "file_path": ".claude/skills/silverloupe/SKILL.md"
+                                },
+                            }
+                        ]
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "result": observation,
+                    "total_cost_usd": 0.125,
+                    "usage": {"input_tokens": 12, "output_tokens": 5},
+                }
+            ),
+        ]
     )
 
 
@@ -103,7 +138,8 @@ def test_build_host_commands_use_verified_noninteractive_isolation_flags(tmp_pat
         "--print",
         "--no-session-persistence",
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
         "--permission-mode",
         "dontAsk",
         "--restricted",
@@ -214,6 +250,85 @@ def test_run_trial_rejects_unknown_host_before_creating_output(tmp_path: Path) -
 
     with pytest.raises(ValueError, match="unsupported eval host"):
         run_trial(_case(), "unknown", "b3", output)
+
+    assert not output.exists()
+
+
+def test_run_trial_resolves_relative_output_before_installing_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "fake-codex"
+    _write_fake_host(executable, stdout=_codex_stream(_observation()))
+    monkeypatch.setenv("SILVERLOUPE_EVAL_CODEX_BIN", str(executable))
+    installer = b"""\
+from pathlib import Path
+import sys
+root = Path(sys.argv[sys.argv.index('--install-root') + 1])
+target = root / '.agents/skills/silverloupe'
+target.mkdir(parents=True)
+(target / 'SKILL.md').write_text('skill\\n', encoding='utf-8')
+"""
+    artifact = tmp_path / "silverloupe-1.0.0.tar.gz"
+    with tarfile.open(artifact, "w:gz") as archive:
+        member = tarfile.TarInfo("silverloupe-1.0.0/install.py")
+        member.size = len(installer)
+        member.mode = 0o755
+        archive.addfile(member, io.BytesIO(installer))
+    monkeypatch.chdir(tmp_path)
+
+    result = run_trial(
+        {**_case(), "artifact": str(artifact)},
+        "codex",
+        "b3",
+        Path("runs/release"),
+    )
+
+    assert result.status == "passed"
+    assert result.output_dir == str((tmp_path / "runs/release").resolve())
+    command = result.metadata["command"]
+    assert command[command.index("-C") + 1] == str(
+        (tmp_path / "runs/release/workspace").resolve()
+    )
+
+
+def test_run_trial_marks_unverifiable_reference_reads_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "fake-codex"
+    _write_fake_host(
+        executable,
+        stdout=_codex_stream(_observation(), include_reference_read=False),
+    )
+    monkeypatch.setenv("SILVERLOUPE_EVAL_CODEX_BIN", str(executable))
+
+    result = run_trial(_case(), "codex", "b3", tmp_path / "trial")
+
+    assert result.status == "partial"
+    assert result.metadata["verification"]["trace_visibility"] == "available"
+    assert result.metadata["verification"]["verified_reference_reads"] == []
+
+
+def test_run_trial_rejects_claimed_artifact_that_does_not_exist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "fake-codex"
+    observation = _observation(artifact_paths=["missing-selection.json"])
+    _write_fake_host(executable, stdout=_codex_stream(observation))
+    monkeypatch.setenv("SILVERLOUPE_EVAL_CODEX_BIN", str(executable))
+
+    result = run_trial(_case(), "codex", "b3", tmp_path / "trial")
+
+    assert result.status == "failed"
+    assert result.errors == ["claimed artifact does not exist: missing-selection.json"]
+
+
+def test_run_trial_rejects_unimplemented_variant_before_creating_output(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "trial"
+
+    with pytest.raises(ValueError, match="unsupported eval variant"):
+        run_trial(_case(), "codex", "b2", output)
 
     assert not output.exists()
 

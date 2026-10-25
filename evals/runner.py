@@ -32,6 +32,7 @@ from evals.release import qualify_release
 ModelT = TypeVar("ModelT", bound=BaseModel)
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SOURCE_ROOT = Path(__file__).parents[1]
+_SUPPORTED_VARIANTS = ("b3",)
 
 
 def _trial_prompt(case: dict[str, Any], variant: str) -> str:
@@ -88,7 +89,8 @@ def _prepare_artifact(artifact: Path, host: str, workspace: Path) -> dict[str, A
         if len(roots) != 1:
             raise ValueError("release archive must contain exactly one root")
         archive.extractall(extracted_root, filter="data")
-    release_root = extracted_root / next(iter(roots))
+    root_name = next(iter(roots))
+    release_root = extracted_root / root_name
     installer = release_root / "install.py"
     if not installer.is_file():
         raise ValueError("release archive does not contain install.py at its root")
@@ -122,7 +124,46 @@ def _prepare_artifact(artifact: Path, host: str, workspace: Path) -> dict[str, A
     return {
         "path": str(artifact),
         "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        "release_version": root_name.removeprefix("silverloupe-"),
         "installer_command": command,
+    }
+
+
+def _verify_observation(
+    case: dict[str, Any], observation: Any, execution: Any, workspace: Path
+) -> tuple[list[str], bool, dict[str, Any]]:
+    errors: list[str] = []
+    partial = False
+    verified_reads = set(execution.verified_reference_reads)
+    claimed_reads = set(observation.reference_reads)
+    expected = case.get("expected", {})
+    expected_skill = expected.get("selected_skill") if isinstance(expected, dict) else None
+    required_read = (
+        f"skills/{expected_skill}/SKILL.md"
+        if isinstance(expected_skill, str)
+        else None
+    )
+    if execution.trace_visibility != "available":
+        partial = True
+    elif required_read is not None and required_read not in verified_reads:
+        partial = True
+    if execution.trace_visibility == "available" and claimed_reads != verified_reads:
+        if claimed_reads - verified_reads:
+            partial = True
+        unreported = sorted(verified_reads - claimed_reads)
+        if unreported:
+            errors.append(f"unreported reference reads: {', '.join(unreported)}")
+
+    for raw_path in observation.artifact_paths:
+        candidate = Path(raw_path)
+        candidate = candidate if candidate.is_absolute() else workspace / candidate
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(workspace) or not resolved.is_file():
+            errors.append(f"claimed artifact does not exist: {raw_path}")
+    return errors, partial, {
+        "trace_visibility": execution.trace_visibility,
+        "verified_reference_reads": sorted(verified_reads),
+        "claimed_reference_reads": sorted(claimed_reads),
     }
 
 
@@ -133,11 +174,13 @@ def run_trial(
 
     if host not in SUPPORTED_HOSTS:
         raise ValueError(f"unsupported eval host: {host}")
+    if variant not in _SUPPORTED_VARIANTS:
+        raise ValueError(f"unsupported eval variant: {variant}")
     case_id = case.get("case_id")
     if not isinstance(case_id, str) or not case_id.strip():
         raise ValueError("trial case requires a non-empty case_id")
     prompt = _trial_prompt(case, variant)
-    output_dir = output_dir.expanduser()
+    output_dir = output_dir.expanduser().resolve()
     if output_dir.exists():
         raise FileExistsError(f"trial output already exists: {output_dir}")
     output_dir.mkdir(parents=True)
@@ -170,10 +213,26 @@ def run_trial(
     trace.write_text(execution.stderr if execution else "", encoding="utf-8")
     errors = [*preparation_errors, *(execution.errors if execution else ())]
     observation = execution.observation if execution else None
+    verification: dict[str, Any] = {
+        "trace_visibility": "unavailable",
+        "verified_reference_reads": [],
+        "claimed_reference_reads": [],
+    }
+    verification_partial = False
     if observation is not None:
         errors.extend(_trial_errors(case, observation))
         errors.extend(observation.errors)
-    status = "failed" if errors or observation is None else observation.status
+        verification_errors, verification_partial, verification = _verify_observation(
+            case, observation, execution, workspace
+        )
+        errors.extend(verification_errors)
+    status = (
+        "failed"
+        if errors or observation is None
+        else "partial"
+        if verification_partial or observation.status == "partial"
+        else observation.status
+    )
     result = TrialResult(
         case_id=case_id,
         host=host,
@@ -194,6 +253,7 @@ def run_trial(
         metadata={
             "command": list(execution.command) if execution else [],
             "exit_code": execution.exit_code if execution else None,
+            "verification": verification,
             **({"artifact": artifact_metadata} if artifact_metadata is not None else {}),
             **(
                 {"observation": observation.model_dump(mode="json")}
@@ -265,11 +325,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         unknown_hosts = sorted(set(hosts) - set(SUPPORTED_HOSTS))
         if unknown_hosts:
             raise ValueError(f"unsupported hosts: {', '.join(unknown_hosts)}")
+        unknown_variants = sorted(set(variants) - set(_SUPPORTED_VARIANTS))
+        if unknown_variants:
+            raise ValueError(f"unsupported variants: {', '.join(unknown_variants)}")
         if args.trials < 1:
             raise ValueError("--trials must be at least 1")
         if args.suite == "release" and args.artifact is None:
             raise ValueError("--artifact is required for the release suite")
-        output = args.output.expanduser()
+        output = args.output.expanduser().resolve()
         if output.exists():
             raise ValueError(f"output already exists: {output}")
         cases_path = (
