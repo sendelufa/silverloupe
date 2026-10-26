@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from html import escape
@@ -102,7 +103,7 @@ def _validate_snapshot(state: RunState, output: Path, session: SessionConfig) ->
         raise ValueError("curation generation is incomplete; run curate again")
 
 
-def _safe_preview(output: Path, asset: Asset | None) -> str | None:
+def _safe_preview(output: Path, asset: Asset | None) -> Path | None:
     if asset is None or not asset.preview_provenance:
         return None
     relative = asset.preview_provenance.get("path")
@@ -116,7 +117,7 @@ def _safe_preview(output: Path, asset: Asset | None) -> str | None:
         return None
     if not candidate.is_file():
         return None
-    return f"../{value.as_posix()}"
+    return candidate
 
 
 def _text(value: Any) -> str:
@@ -133,18 +134,43 @@ def _card(
     decision: Decision,
     assets: dict[str, Asset],
     assessments: dict[str, Assessment],
+    preview_rules: dict[str, str],
 ) -> str:
     primary = assets.get(item.primary_asset_id)
-    preview = _safe_preview(output, primary)
-    image = (
-        f'<a href="{escape(preview, quote=True)}"><img src="{escape(preview, quote=True)}" alt="Preview"></a>'
-        if preview
-        else '<p class="empty">Preview unavailable</p>'
-    )
-    assessment = assessments.get(item.primary_asset_id)
     filename = primary.relative_path if primary is not None else item.primary_asset_id
+    preview = _safe_preview(output, primary)
+    evidence_asset = primary
+    if preview is None:
+        for asset_id in item.member_asset_ids:
+            candidate = assets.get(asset_id)
+            candidate_preview = _safe_preview(output, candidate)
+            if candidate_preview is not None:
+                evidence_asset = candidate
+                preview = candidate_preview
+                break
+    if preview is not None:
+        preview_class = "slp-preview-" + hashlib.sha256(
+            evidence_asset.asset_id.encode("utf-8")
+        ).hexdigest()[:20]
+        encoded = base64.b64encode(preview.read_bytes()).decode("ascii")
+        preview_rules[preview_class] = (
+            f'.{preview_class}{{background-image:url("data:image/jpeg;base64,{encoded}")}}'
+        )
+        image = (
+            f'<div class="preview {preview_class}" role="img" '
+            f'aria-label="Preview of {escape(filename, quote=True)}"></div>'
+        )
+    else:
+        image = '<p class="empty">Preview unavailable</p>'
+    assessment = assessments.get(
+        evidence_asset.asset_id if evidence_asset is not None else item.primary_asset_id
+    )
     rows = [
         ("File", filename),
+        (
+            "Visual evidence file",
+            evidence_asset.relative_path if evidence_asset is not None else "unavailable",
+        ),
         ("Item", item.item_id),
         ("Status", decision.status),
         ("Tier", decision.tier),
@@ -170,9 +196,17 @@ def _section(
     decisions: dict[str, Decision],
     assets: dict[str, Asset],
     assessments: dict[str, Assessment],
+    preview_rules: dict[str, str],
 ) -> str:
     cards = [
-        _card(output, items[item_id], decisions[item_id], assets, assessments)
+        _card(
+            output,
+            items[item_id],
+            decisions[item_id],
+            assets,
+            assessments,
+            preview_rules,
+        )
         for item_id in item_ids
         if item_id in items and item_id in decisions
     ]
@@ -180,7 +214,7 @@ def _section(
     return f"<section><h2>{escape(heading)}</h2><div class=\"grid\">{content}</div></section>"
 
 
-def _render(state: RunState) -> str:
+def _render(state: RunState) -> tuple[str, str]:
     output = Path(state.output_root).resolve()
     session = _read_json(output / "session.json", SessionConfig)
     _validate_snapshot(state, output, session)
@@ -207,8 +241,18 @@ def _render(state: RunState) -> str:
         and item_id not in set(review_ids)
         and item_id not in set(reject_ids)
     ]
+    preview_rules: dict[str, str] = {}
     sections = "".join(
-        _section(name, ids, output, items, decisions, assets, assessments)
+        _section(
+            name,
+            ids,
+            output,
+            items,
+            decisions,
+            assets,
+            assessments,
+            preview_rules,
+        )
         for name, ids in (
             ("Top", top_ids),
             ("Selects", select_ids),
@@ -252,32 +296,140 @@ def _render(state: RunState) -> str:
     template = files("silverloupe.resources").joinpath(
         "templates", "report", "index.html"
     ).read_text(encoding="utf-8")
-    return (
+    document = (
         template.replace("{{SUMMARY}}", summary)
         .replace("{{DISCLOSURE}}", disclosure)
         .replace("{{SECTIONS}}", sections)
         .replace("{{AUDIT}}", audit)
     )
+    stylesheet = '@charset "UTF-8";\n' + "\n".join(
+        preview_rules[name] for name in sorted(preview_rules)
+    )
+    return document, stylesheet
+
+
+def _sha256_path(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _report_marker(output: Path) -> dict[str, Any]:
+    path = output / "report-generation.json"
+    if not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _marker_records(marker: dict[str, Any], source: Path) -> dict[Path, set[str]]:
+    publication_root = marker.get("publication_root")
+    if not isinstance(publication_root, str):
+        return {}
+    if Path(publication_root).expanduser().resolve() != source:
+        return {}
+    owned: dict[Path, set[str]] = {}
+    for key in ("files", "previous_files"):
+        records = marker.get(key, [])
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            relative_value = record.get("path")
+            digest = record.get("sha256")
+            if not isinstance(relative_value, str) or not isinstance(digest, str):
+                continue
+            relative = Path(relative_value)
+            if relative.is_absolute() or ".." in relative.parts:
+                continue
+            owned.setdefault(source / relative, set()).add(digest)
+    return owned
+
+
+def _validate_publication_target(path: Path, allowed_hashes: set[str]) -> None:
+    if path.is_symlink():
+        raise ValueError(f"report target is not owned by Silverloupe: {path}")
+    if not path.exists():
+        return
+    if not path.is_file() or _sha256_path(path) not in allowed_hashes:
+        raise ValueError(f"report target is not owned by Silverloupe: {path}")
+
+
+def _remove_owned_legacy_report(output: Path, marker: dict[str, Any]) -> None:
+    files_value = marker.get("files")
+    generation_id = marker.get("generation_id")
+    if files_value != ["report/index.html"] or not isinstance(generation_id, str):
+        return
+    legacy = output / "report/index.html"
+    if legacy.is_symlink() or not legacy.is_file():
+        return
+    if _sha256_path(legacy) != generation_id:
+        return
+    legacy.unlink()
+    try:
+        legacy.parent.rmdir()
+    except OSError:
+        pass
 
 
 def build_report(state: RunState) -> Path:
-    """Publish one static HTML report behind an auditable generation marker."""
+    """Publish one source-root report with non-importable hidden preview data."""
 
     output = Path(state.output_root).expanduser().resolve()
     validate_output_layout(output)
-    document = _render(state)
+    document, stylesheet = _render(state)
     session = _read_json(output / "session.json", SessionConfig)
-    report_dir = output / "report"
-    report_dir.mkdir(parents=True, exist_ok=True)
-    if report_dir.is_symlink() or not report_dir.resolve().is_relative_to(output):
-        raise ValueError(f"unsafe report directory: {report_dir}")
-    report_path = report_dir / "index.html"
-    generation_id = hashlib.sha256(document.encode("utf-8")).hexdigest()
+    if len(session.source_roots) != 1:
+        raise ValueError("report publication requires exactly one source root")
+    source = Path(session.source_roots[0]).expanduser().resolve()
+    if not source.is_dir():
+        raise FileNotFoundError(f"report source root does not exist: {source}")
+    report_path = source / "report.html"
+    report_assets = source / ".silverloupe-report"
+    stylesheet_path = report_assets / "previews.css"
+    previous_marker = _report_marker(output)
+    owned = _marker_records(previous_marker, source)
+    _validate_publication_target(report_path, owned.get(report_path, set()))
+    _validate_publication_target(stylesheet_path, owned.get(stylesheet_path, set()))
+    if report_assets.is_symlink() or (
+        report_assets.exists()
+        and (
+            not report_assets.is_dir()
+            or stylesheet_path not in owned
+        )
+    ):
+        raise ValueError(
+            f"report assets directory is not owned by Silverloupe: {report_assets}"
+        )
+    document_hash = hashlib.sha256(document.encode("utf-8")).hexdigest()
+    stylesheet_hash = hashlib.sha256(stylesheet.encode("utf-8")).hexdigest()
+    generation_id = hashlib.sha256(
+        f"{document_hash}\0{stylesheet_hash}".encode("ascii")
+    ).hexdigest()
+    files_value = [
+        {"path": "report.html", "sha256": document_hash},
+        {
+            "path": ".silverloupe-report/previews.css",
+            "sha256": stylesheet_hash,
+        },
+    ]
+    previous_files = [
+        {
+            "path": path.relative_to(source).as_posix(),
+            "sha256": _sha256_path(path),
+        }
+        for path in (report_path, stylesheet_path)
+        if path.is_file() and _sha256_path(path) in owned.get(path, set())
+    ]
     marker = {
         "schema_version": 1,
         "generation_id": generation_id,
         "status": "publishing",
-        "files": ["report/index.html"],
+        "publication_root": str(source),
+        "files": files_value,
+        "previous_files": previous_files,
         "run_status": state.status,
         "session_id": session.session_id,
         "session_revision": state.revision,
@@ -287,10 +439,12 @@ def build_report(state: RunState) -> Path:
         marker_path,
         json.dumps(marker, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
     )
+    atomic_write_text(stylesheet_path, stylesheet)
     atomic_write_text(report_path, document)
     marker["status"] = "complete"
     atomic_write_text(
         marker_path,
         json.dumps(marker, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
     )
+    _remove_owned_legacy_report(output, previous_marker)
     return report_path

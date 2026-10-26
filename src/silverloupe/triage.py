@@ -39,6 +39,52 @@ from silverloupe.vision.host_exchange import (
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
+def _evidence_asset_ids(
+    item: SelectionItem, by_asset: dict[str, Assessment]
+) -> list[str]:
+    if item.kind != "capture":
+        return list(item.member_asset_ids)
+    candidates = [
+        asset_id for asset_id in item.member_asset_ids if asset_id in by_asset
+    ]
+    if not candidates:
+        return [item.primary_asset_id]
+
+    def evidence_rank(asset_id: str) -> tuple[int, int, int]:
+        assessment = by_asset[asset_id]
+        visual_rank = {
+            "not_evaluated": 0,
+            "insufficient_evidence": 1,
+            "evaluated": 2,
+        }[assessment.visual_status]
+        return (
+            1 if assessment.evaluation_status == "assessed" else 0,
+            visual_rank,
+            1 if asset_id == item.primary_asset_id else 0,
+        )
+
+    return [max(candidates, key=evidence_rank)]
+
+
+def _items_have_complete_visual_evidence(
+    assessments: list[Assessment], items: list[SelectionItem]
+) -> bool:
+    if not assessments or not items:
+        return False
+    by_asset = {assessment.asset_id: assessment for assessment in assessments}
+    for item in items:
+        evidence_ids = _evidence_asset_ids(item, by_asset)
+        if any(asset_id not in by_asset for asset_id in evidence_ids):
+            return False
+        if any(
+            by_asset[asset_id].evaluation_status != "assessed"
+            or by_asset[asset_id].visual_status != "evaluated"
+            for asset_id in evidence_ids
+        ):
+            return False
+    return True
+
+
 def assess(
     manifest: Manifest,
     groups: list[Group],
@@ -103,7 +149,9 @@ def propose_triage(
             reasons.append("technical_evidence_unavailable")
             member_assessments: list[Assessment] = []
         else:
-            member_assessments = [by_asset[asset_id] for asset_id in item.member_asset_ids]
+            member_assessments = [
+                by_asset[asset_id] for asset_id in _evidence_asset_ids(item, by_asset)
+            ]
             reasons.extend(
                 reason for assessment in member_assessments for reason in assessment.uncertainty
             )
@@ -145,6 +193,9 @@ def propose_triage(
                 provenance={
                     "stage": "technical_triage",
                     "auto_reject_enabled": False,
+                    "evidence_asset_ids": sorted(
+                        assessment.asset_id for assessment in member_assessments
+                    ),
                     "visual_statuses": sorted(
                         {assessment.visual_status for assessment in member_assessments}
                     ),
@@ -305,13 +356,16 @@ def _vision_capability(config: RunConfig) -> str:
 
 
 def _assessment_report(
-    assessments: list[Assessment], decisions: list[Decision], vision: str
+    assessments: list[Assessment],
+    decisions: list[Decision],
+    items: list[SelectionItem],
+    vision: str,
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "status": (
             "completed"
-            if assessments and all(value.visual_status == "evaluated" for value in assessments)
+            if _items_have_complete_visual_evidence(assessments, items)
             else "partial"
         ),
         "assets": len(assessments),
@@ -410,7 +464,9 @@ def assess_prepared(output: Path) -> dict[str, Any]:
     )
     decisions = propose_triage(assessments, items, config.brief)
     decisions = _preserve_user_decisions(decisions, previous_decisions)
-    report = _assessment_report(assessments, decisions, _vision_capability(config))
+    report = _assessment_report(
+        assessments, decisions, items, _vision_capability(config)
+    )
     _publish_assessment_artifacts(output, assessments, decisions, report)
     if invalidated and (output / "vision-status.json").is_file():
         atomic_write_text(
@@ -494,11 +550,16 @@ def import_vision_response_prepared(output: Path, response_path: Path) -> Vision
     items = _read_json_array(output / "selection-items.json", SelectionItem)
     decisions = propose_triage(result.assessments, items, config.brief)
     decisions = _preserve_user_decisions(decisions, _read_decisions(output))
+    evidence_complete = _items_have_complete_visual_evidence(
+        result.assessments, items
+    )
     report = _assessment_report(
         result.assessments,
         decisions,
-        "ready" if result.status == "completed" else "degraded",
+        items,
+        "ready" if evidence_complete else "degraded",
     )
+    result = result.model_copy(update={"status": report["status"]})
     _publish_assessment_artifacts(output, result.assessments, decisions, report)
     atomic_write_text(
         output / "vision-status.json",

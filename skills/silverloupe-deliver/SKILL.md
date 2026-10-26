@@ -13,7 +13,7 @@ description: >
 
 Publish the static report and, only when the user explicitly selected a supported metadata route, build/apply/roll back its delivery transaction. The generic XMP sidecar core is contract-tested; no Lightroom or Photoshop compatibility is inferred from that fact. LightCraft uses a separate native, host-mediated transport.
 
-The runtime dependency is `silverloupe==0.1.0`.
+The runtime dependency is `silverloupe==0.1.2`.
 
 ## Preflight
 
@@ -23,6 +23,10 @@ The runtime dependency is `silverloupe==0.1.0`.
 4. For metadata delivery, require an explicit target and a completed curation generation. Never choose XMP because a native capability is missing.
 
 Why: planning is non-mutating, and an unavailable or unverified editor profile can remain report-only without improvising a writer.
+
+Resolve and compare the requested directory with the `run-state output_root`. Do not
+publish a copied subset: missing canonical state, a mismatched output root, or a folder
+containing only HTML/previews is not a resumable Silverloupe output.
 
 ## Contract map
 
@@ -40,7 +44,14 @@ Execute:
 silverloupe report OUTPUT
 ```
 
-Open `OUTPUT/report/index.html`. The document works without a network connection or JavaScript.
+Open `SOURCE/report.html`, where `SOURCE` is the source root stored in
+`OUTPUT/session.json`. This is the only published HTML report. It works without a
+network connection or JavaScript and loads previews from the hidden
+`SOURCE/.silverloupe-report/previews.css`, which contains no importable JPEG files.
+
+Keep `report.html` and `.silverloupe-report` together. After the review is final, the
+user may delete `OUTPUT`; the report remains readable, but the session can no longer
+be resumed, corrected, audited from JSON, or rebuilt.
 
 The report generation marker remains `publishing` if publication is interrupted. Treat that marker as incomplete even when an older or partially replaced HTML file exists.
 
@@ -49,6 +60,10 @@ The report generation marker remains `publishing` if publication is interrupted.
 For a completed run, describe the report as a reviewable recommendation set.
 
 For a partial run, point to the missing visual evidence and `vision-request.json`. Do not describe empty selection sections as a completed negative judgment.
+
+If `selection.json` or a complete curation generation is absent, do not create or
+publish a replacement Top/Selects page. The only supported publication is the
+canonical partial report generated from the same `OUTPUT`.
 
 For failed or malformed state, report the validation or I/O error and stop.
 
@@ -112,6 +127,7 @@ Provide the static report path as the supported deliverable.
 ## Completion checklist
 
 - [ ] report generation marker is complete;
+- [ ] `SOURCE/report.html` and `SOURCE/.silverloupe-report/previews.css` match the hashes in the generation marker;
 - [ ] every preview link stays inside the output tree;
 - [ ] all artifact-derived text is escaped;
 - [ ] partial status and missing evidence are visible;
@@ -132,6 +148,8 @@ Do not start an interactive cards or swipe server. Do not represent the static r
 ## Common mistakes
 
 - Opening an old HTML file without checking the generation marker.
+- Moving `report.html` without its hidden preview stylesheet.
+- Publishing copied HTML or previews after leaving session state in temporary storage.
 - Treating partial as completed because the report renders.
 - Omitting empty review/reject sections and hiding their meaning.
 - Turning an override exclusion into reject.

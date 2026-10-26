@@ -33,6 +33,14 @@ def _hashes(root: Path) -> dict[str, str]:
     }
 
 
+def _photo_hashes(root: Path) -> dict[str, str]:
+    return {
+        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and path.suffix.casefold() in {".arw", ".jpg", ".jpeg"}
+    }
+
+
 def _config(source: Path, output: Path) -> RunConfig:
     return RunConfig(
         source_roots=[str(source)],
@@ -113,6 +121,44 @@ def test_second_run_after_valid_visual_import_completes_curation(tmp_path: Path)
     assert selection["top_ids"]
     assert set(selection["top_ids"]).issubset(selection["selects_ids"])
     assert load_run_state(output) == state
+
+
+def test_same_stem_unsupported_raw_uses_jpeg_evidence_and_completes(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    _image(source / "IMG_0042.JPG", (20, 40, 60))
+    (source / "IMG_0042.ARW").write_bytes(b"not-a-decodable-raw")
+    config = _config(source, output)
+
+    first = run_session(config)
+    items = json.loads((output / "selection-items.json").read_text(encoding="utf-8"))
+
+    assert first.status == "partial"
+    assert len(items) == 1
+    assert len(items[0]["member_asset_ids"]) == 2
+    assets = [
+        json.loads(line)
+        for line in (output / "assets.jsonl").read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    raw_id = next(
+        asset["asset_id"] for asset in assets if asset["relative_path"].endswith(".ARW")
+    )
+    assert items[0]["primary_asset_id"] == raw_id
+    _complete_vision(output)
+
+    state = run_session(config)
+    report = json.loads((output / "assessment-report.json").read_text(encoding="utf-8"))
+
+    assert state.status == "completed"
+    assert (output / "selection.json").is_file()
+    assert report["status"] == "completed"
+    assert report["assessment_statuses"] == {"assessed": 1, "unassessed": 1}
+    document = build_report(state).read_text(encoding="utf-8")
+    assert "Preview unavailable" not in document
+    assert "IMG_0042.ARW" in document
 
 
 def test_run_state_paths_are_output_owned(tmp_path: Path) -> None:
@@ -323,13 +369,52 @@ def test_partial_report_discloses_missing_visual_evidence(tmp_path: Path) -> Non
     report_path = build_report(state)
     document = report_path.read_text(encoding="utf-8")
 
-    assert report_path == output / "report/index.html"
+    assert report_path == source / "report.html"
+    assert (source / ".silverloupe-report/previews.css").is_file()
+    assert not (output / "report/index.html").exists()
     assert "Partial" in document
     assert "visual evidence" in document.lower()
     assert "vision-request.json" in document
     assert "Real-photo quality metrics: unavailable" in document
     assert "<form" not in document.lower()
     assert "<script" not in document.lower()
+
+
+def test_report_survives_output_deletion_without_importable_preview_files(
+    tmp_path: Path,
+) -> None:
+    source, output = _completed_run(tmp_path)
+
+    report_path = build_report(load_run_state(output))
+    assets_path = source / ".silverloupe-report/previews.css"
+    document = report_path.read_text(encoding="utf-8")
+    stylesheet = assets_path.read_text(encoding="utf-8")
+
+    assert '.silverloupe-report/previews.css' in document
+    assert "data:image/jpeg;base64," in stylesheet
+    assert not list((source / ".silverloupe-report").rglob("*.jpg"))
+    assert not list((source / ".silverloupe-report").rglob("*.jpeg"))
+
+    shutil.rmtree(output)
+
+    assert report_path.is_file()
+    assert assets_path.is_file()
+    assert "data:image/jpeg;base64," in assets_path.read_text(encoding="utf-8")
+
+
+def test_report_refuses_to_overwrite_foreign_source_report(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    _image(source / "frame.jpg", (20, 40, 60))
+    foreign = source / "report.html"
+    foreign.write_text("personal report", encoding="utf-8")
+    state = run_session(_config(source, output))
+
+    with pytest.raises(ValueError, match="not owned by Silverloupe"):
+        build_report(state)
+
+    assert foreign.read_text(encoding="utf-8") == "personal report"
+    assert not (source / ".silverloupe-report").exists()
 
 
 @pytest.mark.parametrize("fixture", ["empty", "corrupt"])
@@ -441,11 +526,11 @@ def test_report_escapes_untrusted_text_and_uses_only_output_relative_previews(
     assert "<script>alert" not in document
     assert "&lt;script&gt;alert" in document
     assert "<img src=x" not in document
-    assert "../previews/" in document
+    assert ".silverloupe-report/previews.css" in document
     assert str(output) not in document
 
 
-@pytest.mark.parametrize("boundary", ["index", "complete-marker"])
+@pytest.mark.parametrize("boundary", ["stylesheet", "report", "complete-marker"])
 def test_interrupted_report_generation_stays_incomplete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
 ) -> None:
@@ -460,7 +545,9 @@ def test_interrupted_report_generation_stays_incomplete(
         nonlocal marker_writes
         if path.name == "report-generation.json":
             marker_writes += 1
-        if boundary == "index" and path.name == "index.html":
+        if boundary == "stylesheet" and path.name == "previews.css":
+            raise OSError("simulated report interruption")
+        if boundary == "report" and path.name == "report.html":
             raise OSError("simulated report interruption")
         if boundary == "complete-marker" and path.name == "report-generation.json" and marker_writes == 2:
             raise OSError("simulated report interruption")
@@ -560,7 +647,7 @@ def test_full_cli_round_trip_and_built_runtime_are_source_independent(
     clean_cwd.mkdir()
     _image(source / "one.jpg", (20, 40, 60))
     _image(source / "two.jpg", (80, 100, 120))
-    before = _hashes(source)
+    before = _photo_hashes(source)
     brief = tmp_path / "brief.json"
     brief.write_text(Brief(genres=["architecture"], top_k=1).model_dump_json(), encoding="utf-8")
     runtime = tmp_path / "installed runtime"
@@ -621,6 +708,8 @@ def test_full_cli_round_trip_and_built_runtime_are_source_independent(
     corrected_decision = next(value for value in decisions if value["item_id"] == corrected_id)
     assert corrected_decision["decision_authority"] == "user"
     assert corrected_decision["tier"] == "select"
-    assert _hashes(source) == before
+    assert _photo_hashes(source) == before
+    assert (source / "report.html").is_file()
+    assert (source / ".silverloupe-report/previews.css").is_file()
     assert not any(part in {"evals", "tests", "docs"} for path in runtime.rglob("*") for part in path.parts)
     assert all(str(Path(__file__).parents[2]) not in path.read_text(encoding="utf-8") for path in runtime.rglob("*.md"))

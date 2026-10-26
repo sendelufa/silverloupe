@@ -13,7 +13,7 @@ description: >
 
 Build the broad selects and ordered top from complete evidence, comparison alternatives, genre priorities, and the user's coverage constraints. Keep unmet constraints visible.
 
-The runtime dependency is `silverloupe==0.1.0`.
+The runtime dependency is `silverloupe==0.1.2`.
 
 ## Preflight
 
@@ -25,6 +25,11 @@ The runtime dependency is `silverloupe==0.1.0`.
    contributed weights.
 
 Why: editorial ranking cannot honestly complete when its evidence generation is incomplete.
+
+Do not curate outside the canonical artifacts. If the workflow is partial, required
+generation markers are incomplete, or `silverloupe curate OUTPUT` does not publish
+`selection.json`, do not hand-rank files into a substitute top, write a parallel
+selection JSON, or build custom ranking HTML.
 
 ## Contract map
 
@@ -74,7 +79,7 @@ Require every top item to appear in selects. Keep ranking scores explicitly unca
 
 Generated decisions use proposal authority. User corrections use user authority and survive reruns.
 
-Ordinary duplicate losers remain `keep/reserve`. Unsupported or insufficiently observed items remain review or unassessed. Version 0.1.0 has no validated automatic reject policy.
+Ordinary duplicate losers remain `keep/reserve`. Unsupported or insufficiently observed items remain review or unassessed. Version 0.1.2 has no validated automatic reject policy.
 
 Why: a false reject is more costly than a conservative reserve recommendation.
 
@@ -112,3 +117,4 @@ Do not claim the top is objectively best, statistically calibrated, accepted by 
 - Hiding coverage conflict: publish the missing labels.
 - Counting RAW and JPEG companions as two selections: use the capture item.
 - Replacing a user override with a newer proposal: user authority has priority.
+- Publishing an improvised top after curation stops: report the canonical partial state instead.

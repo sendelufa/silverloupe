@@ -118,11 +118,40 @@ def test_raw_jpeg_pair_requires_matching_capture_evidence(tmp_path: Path) -> Non
     assert len(build_selection_items(false_stem, groups)) == 2
 
 
+def test_unique_same_directory_raw_jpeg_pair_falls_back_to_file_identity(
+    tmp_path: Path,
+) -> None:
+    manifest = Manifest(
+        assets=[
+            _asset("raw", "shoot/IMG_0042.ARW", captured=None, camera=None),
+            _asset(
+                "jpeg",
+                "shoot/IMG_0042.JPG",
+                captured=None,
+                camera=None,
+                preview=_preview(tmp_path, "IMG_0042"),
+            ),
+        ]
+    )
+
+    groups = group_assets(manifest, _config(tmp_path))
+    pair = _one(groups, "raw_jpeg_companion")
+    items = build_selection_items(manifest, groups)
+
+    assert pair.member_ids == ["jpeg", "raw"]
+    assert pair.confidence_kind == "heuristic"
+    assert pair.evidence == [
+        {"kind": "unique_same_stem_companion", "stem": "img_0042"}
+    ]
+    assert len(items) == 1
+    assert items[0].primary_asset_id == "raw"
+
+
 @pytest.mark.parametrize(
     ("captured", "camera"),
     [(None, "camera-a"), ("2026:10:22 12:00:00", None)],
 )
-def test_raw_jpeg_pair_with_incomplete_identity_stays_uncertain(
+def test_unique_raw_jpeg_pair_with_incomplete_metadata_uses_name_identity(
     tmp_path: Path, captured: str | None, camera: str | None
 ) -> None:
     manifest = Manifest(
@@ -134,8 +163,38 @@ def test_raw_jpeg_pair_with_incomplete_identity_stays_uncertain(
 
     groups = group_assets(manifest, _config(tmp_path))
 
+    pair = _one(groups, "raw_jpeg_companion")
+    assert pair.member_ids == ["jpeg", "raw"]
+    assert pair.confidence_value == 0.9
+    assert pair.evidence == [
+        {"kind": "unique_same_stem_companion", "stem": "img_0042"}
+    ]
+    assert len(build_selection_items(manifest, groups)) == 1
+
+
+def test_same_stem_raw_jpeg_with_conflicting_timestamps_stays_separate(
+    tmp_path: Path,
+) -> None:
+    manifest = Manifest(
+        assets=[
+            _asset(
+                "raw",
+                "shoot/IMG_0042.CR2",
+                captured="2026:10:22 12:00:00",
+                camera=None,
+            ),
+            _asset(
+                "jpeg",
+                "shoot/IMG_0042.JPG",
+                captured="2026:10:22 12:00:10",
+                camera=None,
+            ),
+        ]
+    )
+
+    groups = group_assets(manifest, _config(tmp_path))
+
     assert not [group for group in groups if group.type == "raw_jpeg_companion"]
-    assert _one(groups, "uncertain").member_ids == ["jpeg", "raw"]
     assert len(build_selection_items(manifest, groups)) == 2
 
 

@@ -50,7 +50,9 @@ The core artifacts are:
 - `decisions.jsonl`: recommendation or user-authority decisions.
 - `selection.json`: selects, top, ranked order, coverage, and unmet constraints.
 - `vision-request.json`: auditable host-vision request for a partial run.
-- `report/index.html`: static review report.
+- `SOURCE/report.html`: the only published static review report.
+- `SOURCE/.silverloupe-report/previews.css`: hidden, non-photo preview payload used by the report; preview images are embedded as data URIs rather than importable JPEG files.
+- `report-generation.json`: publication marker in `OUTPUT` with source-relative report paths and hashes.
 
 All exchange schemas use `schema_version: 1`. Paths inside exchange artifacts remain relative to their declared root.
 
@@ -63,6 +65,7 @@ All exchange schemas use `schema_version: 1`. Paths inside exchange artifacts re
 - Keep required HDR, panorama, and focus-stack source assets together.
 - Require `top_ids` to be a subset of `selects_ids`.
 - Preserve user-authority decisions on rerun.
+- Refuse to overwrite a source-root `report.html` or `.silverloupe-report` directory that is not owned by the active Silverloupe publication marker.
 - Report unavailable vision, metrics, and integrations as unavailable.
 
 ## Vision handoff

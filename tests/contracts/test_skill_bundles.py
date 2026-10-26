@@ -120,7 +120,7 @@ def test_source_collection_has_exact_valid_production_skills() -> None:
         assert frontmatter["description"].startswith("Use when")
         assert frontmatter["description"] not in descriptions
         descriptions.add(frontmatter["description"])
-        assert "silverloupe==0.1.0" in document
+        assert "silverloupe==0.1.2" in document
         assert 80 <= len(document.splitlines()) <= 250
         assert "../../resources/contracts.md" in document
 
@@ -151,6 +151,39 @@ def test_deliver_skill_references_all_editor_adapters() -> None:
     assert "../../resources/adapters/lightcraft.md" in document
     for link in _links(path):
         assert (path.parent / link).resolve().is_file()
+
+
+def test_production_skills_enforce_durable_canonical_delivery(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    build_collection(ROOT, runtime, kind="runtime")
+
+    entry = (runtime / "skills/silverloupe/SKILL.md").read_text(encoding="utf-8")
+    prepare = (runtime / "skills/silverloupe-prepare/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    curate = (runtime / "skills/silverloupe-curate/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    deliver = (runtime / "skills/silverloupe-deliver/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    entry_text = " ".join(entry.split())
+    prepare_text = " ".join(prepare.split())
+    curate_text = " ".join(curate.split())
+    deliver_text = " ".join(deliver.split())
+
+    assert "Never use a system temporary directory" in entry_text
+    assert "an unverified host capability" in entry_text
+    assert "Open `SOURCE/report.html`" in entry_text
+    assert "`SOURCE/.silverloupe-report/previews.css`" in entry_text
+    assert "contains no importable JPEG files" in entry_text
+    assert "deleting `OUTPUT` also removes resumability" in entry_text
+    assert "Do not create a substitute top" in entry_text
+    assert "durable user-facing location" in prepare_text
+    assert "Do not curate outside the canonical artifacts" in curate_text
+    assert "Do not publish a copied subset" in deliver_text
+    assert "run-state output_root" in deliver_text
+    assert "Open `SOURCE/report.html`" in deliver_text
 
 
 def test_eval_skill_is_dev_only_and_does_not_trigger_for_ordinary_selection() -> None:

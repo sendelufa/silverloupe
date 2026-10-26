@@ -13,17 +13,23 @@ description: >
 
 Create the source inventory, normalized previews, contact sheets, groups, and selection items that later stages consume. Preparation observes and organizes; it never removes source material.
 
-The runtime dependency is `silverloupe==0.1.0`.
+The runtime dependency is `silverloupe==0.1.2`.
 
 ## Preflight
 
 1. Run `silverloupe doctor`.
-2. Resolve one source directory and one distinct output directory.
+2. Resolve one source directory and one distinct output directory in a durable
+   user-facing location. Do not prepare a normal run under `/tmp`, `/private/tmp`,
+   `mktemp`, or another system-cleaned location.
 3. Confirm the source is readable and the output is writable.
 4. Record unsupported RAW decoding as unavailable rather than installing an unrequested backend.
 5. Stop if an owned output path is a symlink or escapes the output root.
 
 Why: preview generation is safe only when every write is confined to the owned output tree.
+
+The output tree is the resumable product of preparation. Continue grouping,
+assessment, curation, and report generation in this same directory; do not copy only
+the previews or contact sheets into a new report folder.
 
 ## Contract map
 
@@ -112,6 +118,7 @@ Do not call preparation a completed selection. Do not claim sharpness, expressio
 ## Common mistakes
 
 - Scanning the output as input: keep nested output excluded from inventory.
+- Using a temporary output and saving only selected artifacts: keep the canonical state in its final durable location.
 - Treating a JPEG companion as a competing photograph: keep it linked to the capture.
 - Flattening overlapping relationship candidates: preserve uncertainty until composition is resolved.
 - Deleting duplicate bytes: record them; source deletion is outside the workflow.

@@ -105,7 +105,15 @@ uv run --locked silverloupe run /path/to/photos /path/to/output --brief /path/to
 uv run --locked silverloupe report /path/to/output
 ```
 
-Отчёт находится в `output/report/index.html`. Это static, полностью локальный и неинтерактивный HTML без сервера, карточек, свайпов и state-changing JavaScript. В нём всегда есть разделы Top, Selects, Review, Reject и Reserve, причины, alternatives, provenance, coverage, constraints и честные ограничения photo-eval.
+Единственный HTML-отчёт находится в `SOURCE/report.html`. Производные превью
+встроены как data URI в скрытый `SOURCE/.silverloupe-report/previews.css`, поэтому
+Lightroom не видит рядом отдельные JPEG-превью для импорта. Отчёт полностью локальный
+и неинтерактивный: без сервера, карточек, свайпов и state-changing JavaScript. В нём
+всегда есть разделы Top, Selects, Review, Reject и Reserve, причины, alternatives,
+provenance, coverage, constraints и честные ограничения photo-eval. После финального
+просмотра `OUTPUT` можно удалить, но вместе с ним исчезнут resume, JSON-аудит и
+возможность перестроить отчёт; `report.html` и `.silverloupe-report` нужно хранить
+вместе.
 
 Для ручной коррекции создайте JSON-массив с текущим `revision` из `session.json`:
 

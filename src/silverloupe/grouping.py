@@ -311,41 +311,42 @@ def _raw_jpeg_groups(manifest: Manifest) -> list[Group]:
         raw_time, raster_time = _capture_time(raw), _capture_time(raster)
         if raw_camera and raster_camera and raw_camera != raster_camera:
             continue
-        if raw_camera is None or raster_camera is None or raw_time is None or raster_time is None:
-            groups.append(
-                _group(
-                    "uncertain",
-                    [raw.asset_id, raster.asset_id],
-                    confidence_kind="unknown",
-                    confidence_value=None,
-                    protected_set=False,
-                    evidence=[{"kind": "same_stem_insufficient_metadata", "stem": stem}],
+        delta: float | None = None
+        if raw_time is not None and raster_time is not None:
+            delta = _time_delta_seconds(raw_time, raster_time)
+            if delta is None:
+                groups.append(
+                    _group(
+                        "uncertain",
+                        [raw.asset_id, raster.asset_id],
+                        confidence_kind="unknown",
+                        confidence_value=None,
+                        protected_set=False,
+                        evidence=[
+                            {"kind": "same_stem_incomparable_timestamps", "stem": stem}
+                        ],
+                    )
                 )
-            )
-            continue
-        delta = _time_delta_seconds(raw_time, raster_time)
-        if delta is None:
-            groups.append(
-                _group(
-                    "uncertain",
-                    [raw.asset_id, raster.asset_id],
-                    confidence_kind="unknown",
-                    confidence_value=None,
-                    protected_set=False,
-                    evidence=[{"kind": "same_stem_incomparable_timestamps", "stem": stem}],
-                )
-            )
-            continue
-        if delta > 1.5:
-            continue
+                continue
+            if delta > 1.5:
+                continue
+        complete_identity = all(
+            value is not None
+            for value in (raw_camera, raster_camera, raw_time, raster_time)
+        )
+        evidence = (
+            [{"kind": "capture_identity", "stem": stem, "time_delta_seconds": delta}]
+            if complete_identity
+            else [{"kind": "unique_same_stem_companion", "stem": stem}]
+        )
         groups.append(
             _group(
                 "raw_jpeg_companion",
                 [raw.asset_id, raster.asset_id],
                 confidence_kind="heuristic",
-                confidence_value=0.98,
+                confidence_value=0.98 if complete_identity else 0.9,
                 protected_set=False,
-                evidence=[{"kind": "capture_identity", "stem": stem, "time_delta_seconds": delta}],
+                evidence=evidence,
             )
         )
     return groups

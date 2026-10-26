@@ -96,6 +96,37 @@ def test_unsupported_asset_is_unassessed_and_never_rejected(tmp_path: Path) -> N
     assert decisions[0].provenance["auto_reject_enabled"] is False
 
 
+def test_capture_uses_preview_backed_primary_without_claiming_raw_was_observed() -> None:
+    jpeg = Assessment(
+        asset_id="jpeg",
+        evaluation_status="assessed",
+        technical_signals={"decode_status": "ready"},
+        visual_status="evaluated",
+        visual_criteria={"focus_on_relevant_subject": "acceptable"},
+        observed_artifacts=["overview-jpeg"],
+    )
+    raw = Assessment(
+        asset_id="raw",
+        evaluation_status="unassessed",
+        technical_signals={"decode_status": "unsupported"},
+        visual_status="not_evaluated",
+        uncertainty=["decode_unavailable"],
+    )
+    item = SelectionItem(
+        item_id="item-capture",
+        kind="capture",
+        member_asset_ids=["jpeg", "raw"],
+        primary_asset_id="raw",
+    )
+
+    decision = propose_triage([jpeg, raw], [item], Brief())[0]
+
+    assert decision.status == DecisionStatus.KEEP
+    assert "visual_evidence_incomplete" not in decision.reason_codes
+    assert "decode_unavailable" not in decision.reason_codes
+    assert decision.provenance["evidence_asset_ids"] == ["jpeg"]
+
+
 def test_small_preview_requires_review_instead_of_false_reject(tmp_path: Path) -> None:
     preview = _save_preview(tmp_path, "small", Image.new("L", (120, 80), 128))
     manifest = Manifest(assets=[_asset("small", preview=preview)])
