@@ -13,7 +13,7 @@ description: >
 
 Compare only genuine competitors using fixed dimensions and explicit evidence. Allow ties and useful alternatives when trade-offs prevent a single defensible winner.
 
-The runtime dependency is `silverloupe==0.1.2`.
+The runtime dependency is `silverloupe==0.1.3`.
 
 ## Preflight
 
@@ -81,7 +81,7 @@ silverloupe curate OUTPUT
 
 Inspect `decisions.jsonl` for `winner_id`, `alternative_ids`, score components, profile versions, and `score_calibrated: false`.
 
-There is no standalone state-mutating compare command in version 0.1.2. Use prepared evidence and the curation artifact rather than inventing an ad-hoc file format.
+There is no standalone state-mutating compare command in version 0.1.3. Use prepared evidence and the curation artifact rather than inventing an ad-hoc file format.
 
 ## Completion checklist
 

@@ -208,7 +208,7 @@ def write_session(output: Path, config: RunConfig, session_id: str) -> SessionCo
         session_id=session_id,
         source_roots=config.source_roots,
         brief=config.brief,
-        tool_versions={"silverloupe": "0.1.2"},
+        tool_versions={"silverloupe": "0.1.3"},
         rendering_policy=config.rendering_policy,
         runtime_mode=config.runtime_mode,
         budget=config.budget,

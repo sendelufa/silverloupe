@@ -13,7 +13,7 @@ description: >
 
 Run the safe end-to-end photo-culling workflow. Keep the result recommendation-only, preserve originals, and expose missing evidence instead of inventing completion.
 
-The runtime dependency is `silverloupe==0.1.2`.
+The runtime dependency is `silverloupe==0.1.3`.
 
 ## Preflight
 
@@ -130,6 +130,11 @@ the limitation.
 
 ## Manual corrections
 
+To let the user compare alternatives and replace a selected photo in a completed
+session, run `silverloupe review OUTPUT` and keep it running while they use the
+local browser page. Their choice updates the actual selection and report. The
+standalone HTML is view-only; editing requires the saved OUTPUT directory.
+
 Use item IDs and the current session revision. Write a JSON array that follows the runtime contract, then execute:
 
 ```text
@@ -154,4 +159,4 @@ Do not claim measured aesthetic quality, calibrated confidence, Lightroom compat
 - Inventing a wedding checklist: use only the user's coverage labels.
 - Converting duplicate losers to reject: keep them as reserve recommendations.
 - Hiding unsupported files: keep them visible as review or unassessed.
-- Writing editor metadata from the ordinary workflow: version 0.1.2 is report-only.
+- Writing editor metadata from the ordinary workflow: version 0.1.3 is report-only.

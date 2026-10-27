@@ -13,7 +13,7 @@ description: >
 
 Build the broad selects and ordered top from complete evidence, comparison alternatives, genre priorities, and the user's coverage constraints. Keep unmet constraints visible.
 
-The runtime dependency is `silverloupe==0.1.2`.
+The runtime dependency is `silverloupe==0.1.3`.
 
 ## Preflight
 
@@ -79,7 +79,7 @@ Require every top item to appear in selects. Keep ranking scores explicitly unca
 
 Generated decisions use proposal authority. User corrections use user authority and survive reruns.
 
-Ordinary duplicate losers remain `keep/reserve`. Unsupported or insufficiently observed items remain review or unassessed. Version 0.1.2 has no validated automatic reject policy.
+Ordinary duplicate losers remain `keep/reserve`. Unsupported or insufficiently observed items remain review or unassessed. Version 0.1.3 has no validated automatic reject policy.
 
 Why: a false reject is more costly than a conservative reserve recommendation.
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import shutil
+import threading
 from pathlib import Path
 
 import pytest
@@ -377,7 +379,7 @@ def test_partial_report_discloses_missing_visual_evidence(tmp_path: Path) -> Non
     assert "vision-request.json" in document
     assert "Real-photo quality metrics: unavailable" in document
     assert "<form" not in document.lower()
-    assert "<script" not in document.lower()
+    assert '<dialog id="viewer"' in document
 
 
 def test_report_survives_output_deletion_without_importable_preview_files(
@@ -446,8 +448,79 @@ def test_report_cards_keep_details_readable_in_multi_card_sections(tmp_path: Pat
 
     document = build_report(run_session(_config(source, output))).read_text(encoding="utf-8")
 
-    assert "repeat(auto-fit, minmax(260px, 1fr))" in document
-    assert "dl { display: grid; grid-template-columns: minmax(0, 1fr)" in document
+    assert document.count('<details class="metadata">') == 2
+    assert document.count('class="preview slp-preview-') == 2
+    assert '<dialog id="viewer"' in document
+
+
+def test_report_resolves_alternative_items_to_viewable_photos(tmp_path: Path) -> None:
+    _source, output = _completed_run(tmp_path)
+    decisions_path = output / "decisions.jsonl"
+    decisions = [json.loads(line) for line in decisions_path.read_text().splitlines()]
+    decisions[0]["provenance"]["alternative_ids"] = [decisions[1]["item_id"]]
+    decisions_path.write_text("".join(json.dumps(value) + "\n" for value in decisions))
+
+    document = build_report(load_run_state(output)).read_text(encoding="utf-8")
+
+    assert '<details class="alternatives"><summary>Alternatives (1)' in document
+    assert document.count('class="preview slp-preview-') >= 3
+
+
+def test_review_server_applies_alternative_to_actual_selection(tmp_path: Path) -> None:
+    from silverloupe.review_server import create_review_server
+
+    source, output = _completed_run(tmp_path)
+    selection = json.loads((output / "selection.json").read_text())
+    original = selection["top_ids"][0]
+    alternate = next(item for item in selection["ranked_ids"] if item != original)
+    decisions_path = output / "decisions.jsonl"
+    decisions = [json.loads(line) for line in decisions_path.read_text().splitlines()]
+    for decision in decisions:
+        if decision["item_id"] == original:
+            decision["provenance"]["alternative_ids"] = [alternate]
+    decisions_path.write_text("".join(json.dumps(value) + "\n" for value in decisions))
+    before = _photo_hashes(source)
+    server = create_review_server(output)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        connection = http.client.HTTPConnection(host, port)
+        payload = json.dumps({"original": original, "alternate": alternate,
+                              "scope": "top", "revision": 2})
+        connection.request("POST", server.review_path + "replace", payload,
+                           {"Content-Type": "application/json", "Origin": "http://example.com"})
+        response = connection.getresponse()
+        response.read()
+        assert response.status == 403
+        stale = json.dumps({"original": original, "alternate": alternate,
+                            "scope": "top", "revision": 1})
+        connection.request("POST", server.review_path + "replace", stale,
+                           {"Content-Type": "application/json", "Origin": f"http://{host}:{port}"})
+        response = connection.getresponse()
+        response.read()
+        assert response.status == 400
+        assert json.loads((output / "selection.json").read_text()) == selection
+        connection.request("POST", server.review_path + "replace", payload,
+                           {"Content-Type": "application/json",
+                            "Origin": f"http://{host}:{port}"})
+        response = connection.getresponse()
+        body = response.read().decode()
+        assert response.status == 200, body
+        updated = json.loads((output / "selection.json").read_text())
+        assert original not in updated["top_ids"]
+        assert alternate in updated["top_ids"]
+        updated_decisions = [json.loads(line) for line in decisions_path.read_text().splitlines()]
+        assert all(next(d for d in updated_decisions if d["item_id"] == item)["decision_authority"] == "user"
+                   for item in (original, alternate))
+        assert json.loads((output / "session.json").read_text())["revision"] == 3
+        assert _photo_hashes(source) == before
+        assert "revision 3" in (source / "report.html").read_text()
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 def test_complete_report_shows_all_sections_and_provenance(tmp_path: Path) -> None:

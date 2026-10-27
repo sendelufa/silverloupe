@@ -196,7 +196,7 @@ def build_collection(
 
     manifest: dict[str, Any] = {
         "schema_version": 1,
-        "collection_version": "0.1.2",
+        "collection_version": "0.1.3",
         "kind": kind,
         "files": [
             {

@@ -120,7 +120,7 @@ def test_source_collection_has_exact_valid_production_skills() -> None:
         assert frontmatter["description"].startswith("Use when")
         assert frontmatter["description"] not in descriptions
         descriptions.add(frontmatter["description"])
-        assert "silverloupe==0.1.2" in document
+        assert "silverloupe==0.1.3" in document
         assert 80 <= len(document.splitlines()) <= 250
         assert "../../resources/contracts.md" in document
 

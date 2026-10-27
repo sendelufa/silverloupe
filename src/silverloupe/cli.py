@@ -10,6 +10,7 @@ import platform
 import shutil
 import sqlite3
 import sys
+import webbrowser
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -139,6 +140,8 @@ def _parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--brief", required=True, help="path to a strict Brief JSON document")
     report_parser = subparsers.add_parser("report", help="rebuild the static review report")
     report_parser.add_argument("output")
+    review_parser = subparsers.add_parser("review", help="open an interactive local review")
+    review_parser.add_argument("output")
     overrides_parser = subparsers.add_parser(
         "apply-overrides", help="apply revision-bound manual selection corrections"
     )
@@ -519,6 +522,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
             return 0 if state.status == "completed" else 3
+        if args.command == "review":
+            from silverloupe.review_server import create_review_server
+
+            server = create_review_server(Path(args.output))
+            print(f"Interactive review: {server.url}", flush=True)
+            print("Keep this terminal open while reviewing. Press Ctrl+C to stop.", flush=True)
+            webbrowser.open(server.url)
+            try:
+                server.serve_forever()
+            except KeyboardInterrupt:
+                pass
+            finally:
+                server.server_close()
+            return 0
         if args.command == "apply-overrides":
             output = Path(args.output).expanduser().resolve()
             state = apply_overrides(

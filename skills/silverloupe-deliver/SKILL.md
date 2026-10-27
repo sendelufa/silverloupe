@@ -13,7 +13,7 @@ description: >
 
 Publish the static report and, only when the user explicitly selected a supported metadata route, build/apply/roll back its delivery transaction. The generic XMP sidecar core is contract-tested; no Lightroom or Photoshop compatibility is inferred from that fact. LightCraft uses a separate native, host-mediated transport.
 
-The runtime dependency is `silverloupe==0.1.2`.
+The runtime dependency is `silverloupe==0.1.3`.
 
 ## Preflight
 
@@ -46,7 +46,7 @@ silverloupe report OUTPUT
 
 Open `SOURCE/report.html`, where `SOURCE` is the source root stored in
 `OUTPUT/session.json`. This is the only published HTML report. It works without a
-network connection or JavaScript and loads previews from the hidden
+network connection and loads previews from the hidden
 `SOURCE/.silverloupe-report/previews.css`, which contains no importable JPEG files.
 
 Keep `report.html` and `.silverloupe-report` together. After the review is final, the
@@ -93,6 +93,12 @@ Point out:
 Why: delivery is trustworthy when limitations travel with the recommendation.
 
 ## Manual correction handoff
+
+For a completed session when the user wants to compare alternatives and replace a
+selected photo, run `silverloupe review OUTPUT` and open the displayed local URL.
+Keep the command running during review. Choosing an alternative updates the saved
+selection and report using revision-bound user overrides. Opening the HTML file
+directly supports viewing only; it cannot save replacements. Keep OUTPUT for edits.
 
 If the user requests a tier change, create a revision-bound override file and execute:
 

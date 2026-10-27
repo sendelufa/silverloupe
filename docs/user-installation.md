@@ -102,15 +102,15 @@ Intel Mac, Linux и Windows пока не заявлены как поддерж
 uv run --locked python -c '
 from pathlib import Path
 from tools.build_collection import build_release_assets
-print(build_release_assets(Path.cwd(), Path("dist/release"), "0.1.2"))
+print(build_release_assets(Path.cwd(), Path("dist/release"), "0.1.3"))
 '
 ```
 
 Запустить локально собранный bootstrap:
 
 ```bash
-SILVERLOUPE_RELEASE_URL="file://$PWD/dist/release/silverloupe-0.1.2.tar.gz" \
-SILVERLOUPE_RELEASE_SHA256_URL="file://$PWD/dist/release/silverloupe-0.1.2.tar.gz.sha256" \
+SILVERLOUPE_RELEASE_URL="file://$PWD/dist/release/silverloupe-0.1.3.tar.gz" \
+SILVERLOUPE_RELEASE_SHA256_URL="file://$PWD/dist/release/silverloupe-0.1.3.tar.gz.sha256" \
 sh ./install.sh
 ```
 
@@ -138,8 +138,8 @@ uv run --locked python -m evals.runner \
   --suite release \
   --hosts codex,claude \
   --trials 5 \
-  --artifact dist/release/silverloupe-0.1.2.tar.gz \
-  --output runs/release-0.1.2
+  --artifact dist/release/silverloupe-0.1.3.tar.gz \
+  --output runs/release-0.1.3
 ```
 
 Команда расходует host/API budget и не запускается на пользовательском Mac во

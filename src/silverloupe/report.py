@@ -135,6 +135,10 @@ def _card(
     assets: dict[str, Asset],
     assessments: dict[str, Assessment],
     preview_rules: dict[str, str],
+    items: dict[str, SelectionItem] | None = None,
+    decisions: dict[str, Decision] | None = None,
+    scope: str | None = None,
+    replaces: str | None = None,
 ) -> str:
     primary = assets.get(item.primary_asset_id)
     filename = primary.relative_path if primary is not None else item.primary_asset_id
@@ -157,8 +161,9 @@ def _card(
             f'.{preview_class}{{background-image:url("data:image/jpeg;base64,{encoded}")}}'
         )
         image = (
-            f'<div class="preview {preview_class}" role="img" '
-            f'aria-label="Preview of {escape(filename, quote=True)}"></div>'
+            f'<button type="button" class="preview {preview_class}" '
+            f'aria-label="Enlarge {escape(filename, quote=True)}" '
+            f'data-filename="{escape(filename, quote=True)}"></button>'
         )
     else:
         image = '<p class="empty">Preview unavailable</p>'
@@ -185,7 +190,35 @@ def _card(
     details = "".join(
         f"<dt>{escape(label)}</dt><dd>{escape(_text(value))}</dd>" for label, value in rows
     )
-    return f"<article>{image}<h3>{escape(filename)}</h3><dl>{details}</dl></article>"
+    alternatives = ""
+    alternative_ids = decision.provenance.get("alternative_ids", [])
+    if items is not None and decisions is not None and isinstance(alternative_ids, list):
+        candidates = [
+            candidate_id for candidate_id in alternative_ids
+            if isinstance(candidate_id, str) and candidate_id != item.item_id
+            and candidate_id in items and candidate_id in decisions
+        ]
+        if candidates:
+            cards = "".join(
+                _card(output, items[candidate_id], decisions[candidate_id], assets,
+                      assessments, preview_rules, scope=scope, replaces=item.item_id)
+                for candidate_id in dict.fromkeys(candidates)
+            )
+            alternatives = (
+                f'<details class="alternatives"><summary>Alternatives ({len(set(candidates))})'
+                f'</summary><div class="alternative-grid">{cards}</div></details>'
+            )
+    choose = (
+        f'<button class="choose-alternative" type="button" '
+        f'data-original="{escape(replaces, quote=True)}" '
+        f'data-alternate="{escape(item.item_id, quote=True)}" '
+        f'data-scope="{escape(scope, quote=True)}">Choose this photo</button>'
+        if replaces is not None and scope is not None else ""
+    )
+    return (
+        f'<article>{image}<details class="metadata"><summary>Details</summary>'
+        f'<h3>{escape(filename)}</h3><dl>{details}</dl></details>{choose}{alternatives}</article>'
+    )
 
 
 def _section(
@@ -206,6 +239,9 @@ def _section(
             assets,
             assessments,
             preview_rules,
+            items,
+            decisions,
+            {"Top": "top", "Selects": "selects"}.get(heading),
         )
         for item_id in item_ids
         if item_id in items and item_id in decisions
@@ -301,6 +337,7 @@ def _render(state: RunState) -> tuple[str, str]:
         .replace("{{DISCLOSURE}}", disclosure)
         .replace("{{SECTIONS}}", sections)
         .replace("{{AUDIT}}", audit)
+        .replace("{{REVISION}}", str(session.revision))
     )
     stylesheet = '@charset "UTF-8";\n' + "\n".join(
         preview_rules[name] for name in sorted(preview_rules)

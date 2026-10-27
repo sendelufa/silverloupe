@@ -30,8 +30,8 @@ LINK_PATTERN = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
 def test_patch_version_is_consistent_across_runtime_and_project_metadata() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert project["project"]["version"] == "0.1.2"
-    assert silverloupe.__version__ == "0.1.2"
+    assert project["project"]["version"] == "0.1.3"
+    assert silverloupe.__version__ == "0.1.3"
 
 
 def _extract(archive: Path, destination: Path) -> Path:
@@ -135,7 +135,7 @@ def test_release_runtime_imports_without_checkout_or_evals(tmp_path: Path) -> No
         "import importlib.util, pathlib, sys; "
         f"sys.path[:] = [{str(runtime_source)!r}]; "
         "import silverloupe; "
-        "assert silverloupe.__version__ == '0.1.2'; "
+        "assert silverloupe.__version__ == '0.1.3'; "
         "assert importlib.util.find_spec('evals') is None; "
         "print(pathlib.Path(silverloupe.__file__).resolve())"
     )

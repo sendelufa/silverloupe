@@ -13,7 +13,7 @@ description: >
 
 Measure technical signals and request visual evidence without turning a proxy into a verdict. Triage produces recommendation-only decisions and keeps unique or uncertain photographs reviewable.
 
-The runtime dependency is `silverloupe==0.1.2`.
+The runtime dependency is `silverloupe==0.1.3`.
 
 ## Preflight
 

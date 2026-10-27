@@ -13,7 +13,7 @@ description: >
 
 Create the source inventory, normalized previews, contact sheets, groups, and selection items that later stages consume. Preparation observes and organizes; it never removes source material.
 
-The runtime dependency is `silverloupe==0.1.2`.
+The runtime dependency is `silverloupe==0.1.3`.
 
 ## Preflight
 
